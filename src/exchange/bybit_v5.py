@@ -27,9 +27,12 @@ import hmac
 import json
 import os
 import time
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 import httpx
+
+from .account_config import BybitAccountConfig, maybe_load_account_config
 
 
 DEFAULT_BASE_MAINNET = "https://api.bybit.com"
@@ -77,14 +80,47 @@ class BybitV5Client:
         recv_window_ms: int = 5000,
         timeout: float = 10.0,
         category: str | None = None,
+        config_path: str | os.PathLike[str] | None = None,
     ) -> None:
-        self.api_key = api_key or os.environ.get("BYBIT_API_KEY", "")
-        self.api_secret = api_secret or os.environ.get("BYBIT_API_SECRET", "")
+        should_try_config = False
+        resolved_path: str | os.PathLike[str] | None = None
+        if config_path is not None:
+            should_try_config = True
+            resolved_path = config_path
+        else:
+            env_path = os.environ.get("BYBIT_ACCOUNT_CONFIG")
+            if env_path:
+                should_try_config = True
+                resolved_path = env_path
+            else:
+                default_candidate = Path("accountConfig.ini")
+                if default_candidate.exists():
+                    should_try_config = True
+                    resolved_path = default_candidate
+
+        account_config: BybitAccountConfig | None = None
+        if should_try_config:
+            account_config = maybe_load_account_config(
+                resolved_path, strict=config_path is not None
+            )
+
+        self._account_config = account_config
+        self.api_key = api_key or (account_config.api_key if account_config else None)
+        if not self.api_key:
+            self.api_key = os.environ.get("BYBIT_API_KEY", "")
+        self.api_secret = api_secret or (
+            account_config.api_secret if account_config else None
+        )
+        if not self.api_secret:
+            self.api_secret = os.environ.get("BYBIT_API_SECRET", "")
         if not self.api_key or not self.api_secret:
             # Allow unauthenticated market endpoints, but warn on private usage
             pass
         if testnet is None:
-            testnet = os.environ.get("TESTNET", "true").lower() == "true"
+            if account_config is not None:
+                testnet = account_config.testnet
+            else:
+                testnet = os.environ.get("TESTNET", "true").lower() == "true"
         self.base_url = base_url or (
             DEFAULT_BASE_TESTNET if testnet else DEFAULT_BASE_MAINNET
         )
@@ -95,7 +131,40 @@ class BybitV5Client:
         except Exception:
             timeout_obj = timeout
         self._client = httpx.Client(timeout=timeout_obj)
-        self.default_category = category or os.environ.get("BYBIT_CATEGORY", "linear")
+        if category is not None:
+            self.default_category = category
+        elif account_config is not None:
+            self.default_category = account_config.category
+        else:
+            self.default_category = os.environ.get("BYBIT_CATEGORY", "linear")
+
+    @property
+    def account_config(self) -> BybitAccountConfig | None:
+        return self._account_config
+
+    @classmethod
+    def from_config(
+        cls,
+        path: str | os.PathLike[str] | None = None,
+        **kwargs: Any,
+    ) -> "BybitV5Client":
+        account_config = maybe_load_account_config(path, strict=True)
+        overrides: Dict[str, Any] = {
+            "api_key": account_config.api_key,
+            "api_secret": account_config.api_secret,
+            "testnet": account_config.testnet,
+            "category": account_config.category,
+        }
+        overrides.update(kwargs)
+        client = cls(
+            api_key=overrides.pop("api_key"),
+            api_secret=overrides.pop("api_secret"),
+            testnet=overrides.pop("testnet"),
+            category=overrides.pop("category"),
+            **overrides,
+        )
+        client._account_config = account_config
+        return client
 
     # -------- Signing helpers --------
     @staticmethod

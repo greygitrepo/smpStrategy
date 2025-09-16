@@ -19,6 +19,7 @@ import json
 import os
 import threading
 import time
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 
@@ -32,6 +33,9 @@ DEFAULT_WS_MAINNET = "wss://stream.bybit.com/v5/private"
 DEFAULT_WS_TESTNET = "wss://stream-testnet.bybit.com/v5/private"
 
 
+from .account_config import BybitAccountConfig, maybe_load_account_config
+
+
 class BybitPrivateWS:
     def __init__(
         self,
@@ -42,15 +46,48 @@ class BybitPrivateWS:
         recv_window_ms: int = 5000,
         on_message: Optional[Callable[[dict[str, Any]], None]] = None,
         on_error: Optional[Callable[[Exception], None]] = None,
+        config_path: str | os.PathLike[str] | None = None,
     ) -> None:
         if websocket is None:
             raise RuntimeError(
                 "websocket-client is required for private WS; please install it"
             )
-        self.api_key = api_key or os.environ.get("BYBIT_API_KEY", "")
-        self.api_secret = api_secret or os.environ.get("BYBIT_API_SECRET", "")
+        should_try_config = False
+        resolved_path: str | os.PathLike[str] | None = None
+        if config_path is not None:
+            should_try_config = True
+            resolved_path = config_path
+        else:
+            env_path = os.environ.get("BYBIT_ACCOUNT_CONFIG")
+            if env_path:
+                should_try_config = True
+                resolved_path = env_path
+            else:
+                default_candidate = Path("accountConfig.ini")
+                if default_candidate.exists():
+                    should_try_config = True
+                    resolved_path = default_candidate
+
+        account_config: BybitAccountConfig | None = None
+        if should_try_config:
+            account_config = maybe_load_account_config(
+                resolved_path, strict=config_path is not None
+            )
+
+        self._account_config = account_config
+        self.api_key = api_key or (account_config.api_key if account_config else None)
+        if not self.api_key:
+            self.api_key = os.environ.get("BYBIT_API_KEY", "")
+        self.api_secret = api_secret or (
+            account_config.api_secret if account_config else None
+        )
+        if not self.api_secret:
+            self.api_secret = os.environ.get("BYBIT_API_SECRET", "")
         if testnet is None:
-            testnet = os.environ.get("TESTNET", "true").lower() == "true"
+            if account_config is not None:
+                testnet = account_config.testnet
+            else:
+                testnet = os.environ.get("TESTNET", "true").lower() == "true"
         self.url = DEFAULT_WS_TESTNET if testnet else DEFAULT_WS_MAINNET
         self.recv_window_ms = recv_window_ms
         self.on_message = on_message
@@ -58,6 +95,10 @@ class BybitPrivateWS:
         self.ws: Optional["websocket.WebSocketApp"] = None
         self._thread: Optional[threading.Thread] = None
         self._should_stop = threading.Event()
+
+    @property
+    def account_config(self) -> BybitAccountConfig | None:
+        return self._account_config
 
     def _sign(self, ts_ms: int) -> str:
         prehash = f"{ts_ms}{self.api_key}{self.recv_window_ms}"
