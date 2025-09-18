@@ -18,6 +18,8 @@ from src.config.account_config import (  # noqa: E402  pylint: disable=wrong-imp
     resolve_config_path,
 )
 from src.config import (  # noqa: E402  pylint: disable=wrong-import-position
+    default_new_listing_strategy_config,
+    maybe_load_new_listing_strategy_config,
     maybe_load_symbol_strategy_config,
 )
 from src.data import WalletDataManager  # noqa: E402  pylint: disable=wrong-import-position
@@ -28,6 +30,7 @@ from src.data.symbol import (  # noqa: E402  pylint: disable=wrong-import-positi
     SymbolDiscoveryStrategy,
 )
 from src.exchange.bybit_v5 import BybitV5Client  # noqa: E402  pylint: disable=wrong-import-position
+from src.strategy import NewListingTradingStrategy  # noqa: E402  pylint: disable=wrong-import-position
 
 logger = logging.getLogger("smpStrategy")
 
@@ -106,6 +109,7 @@ def main() -> None:
         client=client,
         strategy_config=strategy_config,
     )
+    symbols: list[str] = []
     try:
         symbols = discovery.fetch_once()
         if symbols:
@@ -122,7 +126,22 @@ def main() -> None:
             )
     except Exception as exc:  # noqa: BLE001
         logger.exception("Symbol discovery failed: %s", exc)
-    # TODO: Extend with the actual trading strategy logic.
+    trading_config = (
+        maybe_load_new_listing_strategy_config()
+        or default_new_listing_strategy_config()
+    )
+    trading_strategy = NewListingTradingStrategy(
+        client=client,
+        discovery=discovery,
+        wallet_manager=wallet_manager,
+        position_tracker=position_tracker,
+        config=trading_config,
+        category=category,
+    )
+    try:
+        trading_strategy.run_once(initial_candidates=symbols)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("New listing trading strategy failed: %s", exc)
 
 
 if __name__ == "__main__":

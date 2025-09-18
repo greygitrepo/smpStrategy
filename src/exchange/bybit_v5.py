@@ -384,8 +384,15 @@ class BybitV5Client:
             return j
 
     # -------- Public market endpoints --------
-    def get_symbols(self, category: Optional[str] = None) -> Dict[str, Any]:
+    def get_symbols(
+        self,
+        category: Optional[str] = None,
+        *,
+        symbol: Optional[str] = None,
+    ) -> Dict[str, Any]:
         params = {"category": category or self.default_category}
+        if symbol:
+            params["symbol"] = symbol
         return self._request(
             "GET", "/v5/market/instruments-info", params=params, auth=False
         )
@@ -409,6 +416,26 @@ class BybitV5Client:
     ) -> Dict[str, Any]:
         params = {"category": category or self.default_category, "symbol": symbol}
         return self._request("GET", "/v5/market/tickers", params=params, auth=False)
+
+    def get_kline(
+        self,
+        *,
+        category: Optional[str] = None,
+        symbol: str,
+        interval: str,
+        start: Optional[int] = None,
+        end: Optional[int] = None,
+        limit: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        params: Dict[str, Any] = {
+            "category": category or self.default_category,
+            "symbol": symbol,
+            "interval": interval,
+            "start": start,
+            "end": end,
+            "limit": limit,
+        }
+        return self._request("GET", "/v5/market/kline", params=params, auth=False)
 
     def get_fee_rate(
         self, category: Optional[str] = None, symbol: Optional[str] = None
