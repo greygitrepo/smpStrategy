@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 # allow running as a script (e.g. F5 in IDE) without manual PYTHONPATH tweaks
@@ -36,6 +37,22 @@ from src.strategy import NewListingTradingStrategy  # noqa: E402  pylint: disabl
 logger = logging.getLogger("smpStrategy")
 
 
+def _setup_logging() -> Path:
+    log_dir = Path(__file__).resolve().parents[2] / "log"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = log_dir / f"smpStrategy_{timestamp}.log"
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s - %(message)s",
+        handlers=[
+            logging.StreamHandler(sys.stdout),
+            logging.FileHandler(log_file, encoding="utf-8"),
+        ],
+    )
+    return log_file
+
+
 def _require_account_config() -> BybitV5Client:
     config = maybe_load_account_config()
     if config is None:
@@ -60,7 +77,8 @@ def _require_account_config() -> BybitV5Client:
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO)
+    log_file = _setup_logging()
+    logger.info("Logging to %s", log_file)
     client = _require_account_config()
     logger.info("Bybit REST client ready: base_url=%s", client.base_url)
     wallet_manager = WalletDataManager(client=client)
