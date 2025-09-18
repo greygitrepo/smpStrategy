@@ -27,12 +27,15 @@ import hmac
 import json
 import os
 import time
-from pathlib import Path
 from typing import Any, Dict, Optional
 
 import httpx
 
-from .account_config import BybitAccountConfig, maybe_load_account_config
+from ..config.account_config import (
+    BybitAccountConfig,
+    maybe_load_account_config,
+    resolve_config_path,
+)
 
 
 DEFAULT_BASE_MAINNET = "https://api.bybit.com"
@@ -93,7 +96,7 @@ class BybitV5Client:
                 should_try_config = True
                 resolved_path = env_path
             else:
-                default_candidate = Path("accountConfig.ini")
+                default_candidate = resolve_config_path()
                 if default_candidate.exists():
                     should_try_config = True
                     resolved_path = default_candidate

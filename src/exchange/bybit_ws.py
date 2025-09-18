@@ -19,7 +19,6 @@ import json
 import os
 import threading
 import time
-from pathlib import Path
 from typing import Any, Callable, Optional
 
 
@@ -33,7 +32,11 @@ DEFAULT_WS_MAINNET = "wss://stream.bybit.com/v5/private"
 DEFAULT_WS_TESTNET = "wss://stream-testnet.bybit.com/v5/private"
 
 
-from .account_config import BybitAccountConfig, maybe_load_account_config
+from ..config.account_config import (
+    BybitAccountConfig,
+    maybe_load_account_config,
+    resolve_config_path,
+)
 
 
 class BybitPrivateWS:
@@ -63,7 +66,7 @@ class BybitPrivateWS:
                 should_try_config = True
                 resolved_path = env_path
             else:
-                default_candidate = Path("accountConfig.ini")
+                default_candidate = resolve_config_path()
                 if default_candidate.exists():
                     should_try_config = True
                     resolved_path = default_candidate

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Utilities for managing Bybit account configuration stored in accountConfig.ini."""
+"""Utilities for managing Bybit account configuration stored under config/accountConfig.ini."""
 
 import configparser
 import getpass
@@ -11,6 +11,7 @@ from typing import Optional
 
 _CONFIG_ENV_VAR = "BYBIT_ACCOUNT_CONFIG"
 _DEFAULT_FILE_NAME = "accountConfig.ini"
+_CONFIG_DIR = Path(__file__).resolve().parents[2] / "config"
 
 
 @dataclass
@@ -46,6 +47,7 @@ def resolve_config_path(path: str | os.PathLike[str] | None = None) -> Path:
     env_path = os.environ.get(_CONFIG_ENV_VAR)
     if env_path:
         candidates.append(Path(env_path).expanduser())
+    candidates.append(_CONFIG_DIR / _DEFAULT_FILE_NAME)
     candidates.append(Path(_DEFAULT_FILE_NAME))
     for candidate in candidates:
         if candidate.exists():
@@ -105,13 +107,13 @@ def interactive_setup(
     *,
     force: bool = False,
 ) -> Path:
-    """Prompt the user for account credentials and write accountConfig.ini.
+    """Prompt the user for account credentials and write config/accountConfig.ini.
 
     Parameters
     ----------
     path:
-        Optional location for the config file. Defaults to accountConfig.ini in cwd or the
-        `BYBIT_ACCOUNT_CONFIG` override if it resolves to an existing file.
+        Optional location for the config file. Defaults to config/accountConfig.ini in the
+        project root, or the `BYBIT_ACCOUNT_CONFIG` override if it resolves to an existing file.
     force:
         Overwrite an existing file instead of prompting the user to confirm.
     """
@@ -139,6 +141,7 @@ def interactive_setup(
         "testnet": "true" if testnet else "false",
         "category": category,
     }
+    config_path.parent.mkdir(parents=True, exist_ok=True)
     with config_path.open("w") as fh:
         parser.write(fh)
     print(f"Saved Bybit account configuration to {config_path}")
@@ -154,7 +157,7 @@ def fetch_wallet_balance_from_config(
     """Convenience helper to fetch wallet balance using credentials stored in config."""
 
     config = load_account_config(path)
-    from .bybit_v5 import BybitV5Client
+    from ..exchange.bybit_v5 import BybitV5Client
 
     client = BybitV5Client(
         api_key=config.api_key,
