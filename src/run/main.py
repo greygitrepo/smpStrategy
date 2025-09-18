@@ -64,13 +64,22 @@ def main() -> None:
     client = _require_account_config()
     logger.info("Bybit REST client ready: base_url=%s", client.base_url)
     wallet_manager = WalletDataManager(client=client)
-    snapshot = wallet_manager.fetch_once()
-    logger.info(
-        "USDT wallet: equity=%s available=%s wallet_balance=%s",
-        snapshot.total_equity,
-        snapshot.available_balance,
-        snapshot.wallet_balance,
-    )
+    wallet_snapshot = None
+    try:
+        wallet_snapshot = wallet_manager.fetch_once()
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Initial wallet fetch failed: %s", exc)
+    if wallet_snapshot is not None:
+        logger.info(
+            "USDT wallet: equity=%s available=%s wallet_balance=%s",
+            wallet_snapshot.total_equity,
+            wallet_snapshot.available_balance,
+            wallet_snapshot.wallet_balance,
+        )
+    else:
+        logger.warning(
+            "Wallet snapshot unavailable; trading loop will rely on later refresh"
+        )
     strategy_config = maybe_load_symbol_strategy_config()
     category = (
         strategy_config.category
