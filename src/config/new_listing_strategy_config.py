@@ -41,7 +41,9 @@ class NewListingStrategyConfig:
     tp_pct: float = 0.014
     sl_pct: float = 0.014
     min_5m_bars: int = 20
+    max_new_positions: int = 3
     requirements: tuple[TimeframeRequirement, ...] = ()
+    exclude_symbols: tuple[str, ...] = ()
 
     @property
     def weights(self) -> dict[str, float]:
@@ -87,6 +89,13 @@ def _normalize_percent(value: float, *, assume_percent: bool = False) -> float:
     if assume_percent and value > 1:
         return value / 100.0
     return value
+
+
+def _parse_symbol_list(raw: str) -> tuple[str, ...]:
+    if not raw:
+        return ()
+    symbols = [sym.strip().upper() for sym in raw.split(",")]
+    return tuple(sorted({sym for sym in symbols if sym}))
 
 
 def _parse_requirement(section_name: str, section: configparser.SectionProxy) -> TimeframeRequirement:
@@ -174,6 +183,7 @@ def load_new_listing_strategy_config(
         ),
     )
     min_5m_bars = max(1, base.getint("min_5m_bars", fallback=20))
+    max_new_positions = max(1, base.getint("max_new_positions", fallback=3))
     requirement_sections: list[TimeframeRequirement] = []
     prefix = f"{base_section_name}."
     for section_name in parser.sections():
@@ -189,6 +199,7 @@ def load_new_listing_strategy_config(
             reverse=True,
         )
     )
+    exclude_symbols = _parse_symbol_list(base.get("exclude_symbols", fallback=""))
     config = NewListingStrategyConfig(
         enabled=enabled,
         ema_period=ema_period,
@@ -201,7 +212,9 @@ def load_new_listing_strategy_config(
         tp_pct=tp_pct,
         sl_pct=sl_pct,
         min_5m_bars=min_5m_bars,
+        max_new_positions=max_new_positions,
         requirements=requirements,
+        exclude_symbols=exclude_symbols,
     )
     return config
 
@@ -235,5 +248,7 @@ def default_new_listing_strategy_config() -> NewListingStrategyConfig:
                 min_60m=req.min_60m,
             )
             for req in _DEFAULT_REQUIREMENTS
-        )
+        ),
+        max_new_positions=3,
+        exclude_symbols=(),
     )

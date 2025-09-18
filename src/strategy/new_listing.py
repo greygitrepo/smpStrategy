@@ -2,9 +2,13 @@ from __future__ import annotations
 
 """New listing trading strategy implementation."""
 
+import json
 import logging
 import math
+from collections import deque
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Iterable, Optional
 
 from src.config.new_listing_strategy_config import (
@@ -20,6 +24,10 @@ from src.data.wallet_manager import WalletDataManager
 from src.exchange.bybit_v5 import BybitAPIError, BybitV5Client
 
 logger = logging.getLogger("smpStrategy.strategy.new_listing")
+
+_STOP_LOSS_WINDOW = timedelta(hours=12)
+_STOP_LOSS_LIMIT = 3
+_EXCLUSION_FILE_NAME = "newListingStrategy.exclusions.json"
 
 
 @dataclass(slots=True)
@@ -62,6 +70,14 @@ class NewListingTradingStrategy:
         self._config = resolved_config
         self._category = category or getattr(client, "default_category", None) or "linear"
         self._leverage_cache: set[str] = set()
+        self._static_exclusions: set[str] = {sym.upper() for sym in self._config.exclude_symbols}
+        self._dynamic_exclusions: set[str] = set()
+        self._excluded_symbols: set[str] = set(self._static_exclusions)
+        self._stop_loss_events: dict[str, deque[datetime]] = {}
+        self._exclusion_file = self._resolve_exclusion_file()
+        self._load_persisted_exclusions()
+        if self._static_exclusions:
+            logger.info("Static exclusions configured: %s", ", ".join(sorted(self._static_exclusions)))
 
     def run_once(self, *, initial_candidates: Optional[Iterable[str]] = None) -> None:
         if not self._config.enabled:
@@ -84,6 +100,20 @@ class NewListingTradingStrategy:
         if not symbols:
             logger.info("No candidate symbols retrieved from discovery store")
             return
+        filtered_symbols: list[str] = []
+        for symbol in symbols:
+            upper_symbol = symbol.upper()
+            if upper_symbol in self._excluded_symbols:
+                logger.debug("Skipping %s because it is excluded", upper_symbol)
+                continue
+            filtered_symbols.append(upper_symbol)
+        if not filtered_symbols:
+            logger.info(
+                "All candidate symbols are excluded; skipping run (exclusions=%s)",
+                ", ".join(sorted(self._excluded_symbols)) or "<empty>",
+            )
+            return
+        symbols = filtered_symbols
         logger.info(
             "Evaluating %s candidates (available=%s)",
             len(symbols),
@@ -91,12 +121,20 @@ class NewListingTradingStrategy:
         )
         active_symbols = {sym.upper() for sym in positions}
         remaining_available = available
+        new_positions_opened = 0
+        max_new_positions = self._config.max_new_positions
         for idx, symbol in enumerate(symbols):
             symbol = symbol.upper()
             logger.debug("[%s/%s] Processing symbol %s", idx + 1, len(symbols), symbol)
             if symbol in active_symbols:
                 logger.debug("Skipping %s because a position is already open", symbol)
                 continue
+            if new_positions_opened >= max_new_positions:
+                logger.info(
+                    "Reached max new positions limit (%s); stopping evaluation loop",
+                    max_new_positions,
+                )
+                break
             try:
                 notional_used = self._evaluate_symbol(symbol, remaining_available)
             except Exception as exc:  # noqa: BLE001 - log and continue per symbol
@@ -110,6 +148,7 @@ class NewListingTradingStrategy:
                 continue
             remaining_available = max(0.0, remaining_available - notional_used)
             active_symbols.add(symbol)
+            new_positions_opened += 1
             logger.info(
                 "Order placed for %s using approx notional=%s; remaining_available=%s",
                 symbol,
@@ -148,7 +187,7 @@ class NewListingTradingStrategy:
                 self._close_position(snapshot)
             elif pnl_rate <= -sl_threshold:
                 logger.info("Stopping loss on %s with pnl_rate=%.2f%%", symbol, pnl_rate)
-                self._close_position(snapshot)
+                self._handle_stop_loss(snapshot)
 
     def _close_position(self, snapshot: PositionSnapshot) -> None:
         side = snapshot.side.lower()
@@ -175,6 +214,81 @@ class NewListingTradingStrategy:
             logger.error("Failed to close %s due to API error: %s", snapshot.symbol, api_exc)
         except Exception as exc:  # noqa: BLE001
             logger.exception("Unexpected error while closing %s: %s", snapshot.symbol, exc)
+
+    def _handle_stop_loss(self, snapshot: PositionSnapshot) -> None:
+        symbol = snapshot.symbol.upper()
+        self._record_stop_loss(symbol)
+        self._close_position(snapshot)
+
+    def _record_stop_loss(self, symbol: str) -> None:
+        now = datetime.now(timezone.utc)
+        events = self._stop_loss_events.setdefault(symbol, deque())
+        events.append(now)
+        while events and now - events[0] > _STOP_LOSS_WINDOW:
+            events.popleft()
+        if len(events) >= _STOP_LOSS_LIMIT:
+            hours = int(_STOP_LOSS_WINDOW.total_seconds() // 3600)
+            reason = f"{len(events)} stop losses within the last {hours}h"
+            self._exclude_symbol(symbol, reason)
+            events.clear()
+
+    def _exclude_symbol(self, symbol: str, reason: str) -> None:
+        if symbol in self._excluded_symbols:
+            logger.debug("Symbol %s already excluded: %s", symbol, reason)
+            return
+        if symbol in self._static_exclusions:
+            logger.debug("Symbol %s is statically excluded; reason=%s", symbol, reason)
+            return
+        self._dynamic_exclusions.add(symbol)
+        self._excluded_symbols.add(symbol)
+        logger.warning("Excluding %s from discovery: %s", symbol, reason)
+        self._persist_exclusions()
+
+    def _resolve_exclusion_file(self) -> Path:
+        return Path(__file__).resolve().parents[2] / "config" / _EXCLUSION_FILE_NAME
+
+    def _load_persisted_exclusions(self) -> None:
+        path = self._exclusion_file
+        try:
+            if not path.exists():
+                return
+            with path.open(encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning("Failed to load persisted exclusions from %s: %s", path, exc)
+            return
+        if isinstance(payload, list):
+            dynamic = {str(value).upper() for value in payload if str(value).strip()}
+            self._dynamic_exclusions.update(dynamic)
+            self._excluded_symbols.update(dynamic)
+            if dynamic:
+                logger.info(
+                    "Loaded %s persisted exclusions: %s",
+                    len(dynamic),
+                    ", ".join(sorted(dynamic)),
+                )
+        else:
+            logger.warning(
+                "Unexpected exclusion payload in %s (expected list, got %s)",
+                path,
+                type(payload),
+            )
+
+    def _persist_exclusions(self) -> None:
+        path = self._exclusion_file
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("w", encoding="utf-8") as handle:
+                json.dump(
+                    sorted(self._dynamic_exclusions),
+                    handle,
+                    ensure_ascii=True,
+                    indent=2,
+                )
+        except OSError as exc:
+            logger.error("Failed to persist exclusions to %s: %s", path, exc)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Unexpected error while persisting exclusions to %s: %s", path, exc)
 
     # ----- Symbol evaluation -----
     def _fetch_candidate_symbols(self) -> list[str]:
