@@ -121,18 +121,26 @@ class NewListingTradingStrategy:
         )
         active_symbols = {sym.upper() for sym in positions}
         remaining_margin = available
+        max_new_positions = max(0, self._config.max_new_positions)
+        open_slots = max(0, max_new_positions - len(active_symbols))
+        if open_slots == 0:
+            logger.info(
+                "No capacity for new positions (open=%s max=%s); skipping run",
+                len(active_symbols),
+                max_new_positions,
+            )
+            return
         new_positions_opened = 0
-        max_new_positions = self._config.max_new_positions
         for idx, symbol in enumerate(symbols):
             symbol = symbol.upper()
             logger.debug("[%s/%s] Processing symbol %s", idx + 1, len(symbols), symbol)
             if symbol in active_symbols:
                 logger.debug("Skipping %s because a position is already open", symbol)
                 continue
-            if new_positions_opened >= max_new_positions:
+            if new_positions_opened >= open_slots:
                 logger.info(
-                    "Reached max new positions limit (%s); stopping evaluation loop",
-                    max_new_positions,
+                    "Reached available slot limit (%s remaining slots); stopping evaluation loop",
+                    open_slots,
                 )
                 break
             logger.debug(
@@ -156,12 +164,13 @@ class NewListingTradingStrategy:
             active_symbols.add(symbol)
             new_positions_opened += 1
             logger.info(
-                "Order placed for %s using notional=%.6f (margin_used=%.6f leverage=%s); remaining_margin=%.6f",
+                "Order placed for %s using notional=%.6f (margin_used=%.6f leverage=%s); remaining_margin=%.6f open_slots_remaining=%s",
                 symbol,
                 notional_used,
                 margin_used,
                 self._config.leverage,
                 remaining_margin,
+                open_slots - new_positions_opened,
             )
             if remaining_margin <= 0:
                 logger.info("Reached capital allocation margin limit; stopping evaluation loop")
