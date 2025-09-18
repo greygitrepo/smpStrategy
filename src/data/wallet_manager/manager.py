@@ -130,20 +130,46 @@ class WalletDataManager:
             (c for c in coin_entries if c.get("coin") == self._coin),
             coin_entries[0],
         )
-        def _as_float(key: str) -> float:
-            value = desired_coin.get(key)
+        def _get_float(source: dict[str, Any], key: str) -> Optional[float]:
+            value = source.get(key)
             if value is None:
-                return 0.0
+                return None
             try:
                 return float(value)
             except (TypeError, ValueError):
                 logger.debug("Failed to cast %s=%s to float", key, value)
-                return 0.0
+                return None
+
+        def _as_float(key: str) -> float:
+            value = _get_float(desired_coin, key)
+            return value if value is not None else 0.0
+
+        def _available_balance() -> float:
+            for key in ("totalAvailableBalance",):
+                value = _get_float(entry, key)
+                if value is not None:
+                    return value
+            coin_keys = ("availableBalance", "availableToTrade", "availableToWithdraw")
+            for key in coin_keys:
+                value = _get_float(desired_coin, key)
+                if value is not None:
+                    return value
+            wallet_balance = _get_float(desired_coin, "walletBalance")
+            total_position_im = _get_float(desired_coin, "totalPositionIM") or 0.0
+            total_order_im = _get_float(desired_coin, "totalOrderIM") or 0.0
+            if wallet_balance is not None:
+                available = wallet_balance - total_position_im - total_order_im
+                return max(0.0, available)
+            equity = _get_float(desired_coin, "equity")
+            if equity is not None:
+                available = equity - total_position_im - total_order_im
+                return max(0.0, available)
+            return 0.0
         snapshot = WalletSnapshot(
             account_type=entry.get("accountType", self._account_type),
             coin=desired_coin.get("coin", self._coin),
             total_equity=_as_float("equity"),
-            available_balance=_as_float("availableToWithdraw"),
+            available_balance=_available_balance(),
             wallet_balance=_as_float("walletBalance"),
             fetched_at=datetime.now(timezone.utc),
             raw=response,
