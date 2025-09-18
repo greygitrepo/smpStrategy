@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import sys
+import time
 from pathlib import Path
 
 # allow running as a script (e.g. F5 in IDE) without manual PYTHONPATH tweaks
@@ -138,10 +139,18 @@ def main() -> None:
         config=trading_config,
         category=category,
     )
+    first_symbols: list[str] | None = symbols
+    logger.info("Starting continuous new-listing strategy loop with 5s delay")
     try:
-        trading_strategy.run_once(initial_candidates=symbols)
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("New listing trading strategy failed: %s", exc)
+        while True:
+            try:
+                trading_strategy.run_once(initial_candidates=first_symbols)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("New listing trading strategy failed: %s", exc)
+            first_symbols = None
+            time.sleep(5.0)
+    except KeyboardInterrupt:
+        logger.info("Received interrupt, stopping trading loop")
 
 
 if __name__ == "__main__":

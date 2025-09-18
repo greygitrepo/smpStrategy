@@ -172,15 +172,17 @@ class NewListingTradingStrategy:
     def _manage_open_positions(self, positions: dict[str, PositionSnapshot]) -> None:
         if not positions:
             return
-        tp_threshold = self._config.tp_pct * 100.0
-        sl_threshold = self._config.sl_pct * 100.0
-        logger.debug(
-            "Managing %s open positions (TP=%.2f%% SL=%.2f%%)",
-            len(positions),
-            tp_threshold,
-            sl_threshold,
-        )
         for symbol, snapshot in positions.items():
+            leverage = snapshot.leverage if snapshot.leverage > 0 else 1.0
+            tp_threshold = self._config.tp_pct * leverage * 100.0
+            sl_threshold = self._config.sl_pct * leverage * 100.0
+            logger.debug(
+                "Evaluating %s with leverage=%.2f (TP=%.2f%% SL=%.2f%%)",
+                symbol,
+                leverage,
+                tp_threshold,
+                sl_threshold,
+            )
             pnl_rate = snapshot.pnl_rate
             if pnl_rate >= tp_threshold:
                 logger.info("Taking profit on %s with pnl_rate=%.2f%%", symbol, pnl_rate)
