@@ -5,15 +5,22 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Optional
+
+from src.config.symbol_strategy_config import (
+    SymbolStrategyConfig,
+    maybe_load_symbol_strategy_config,
+)
 
 from .client import build_client
 from .constants import (
     DEFAULT_CATEGORY,
     DEFAULT_DISCOVERY_INTERVAL,
     DEFAULT_SETTLE_COIN,
+    DEFAULT_SYMBOL_LIMIT,
 )
 from .store import DiscoveredSymbolStore
+from .strategies import SymbolFinder, create_symbol_finder
 
 logger = logging.getLogger("smpStrategy.symbol.discovery")
 
@@ -29,15 +36,53 @@ class SymbolDiscoveryStrategy:
         *,
         client: Optional["BybitV5Client"] = None,
         store: Optional[DiscoveredSymbolStore] = None,
-        category: str = DEFAULT_CATEGORY,
-        settle_coin: str = DEFAULT_SETTLE_COIN,
-        refresh_interval: float = DEFAULT_DISCOVERY_INTERVAL,
+        category: Optional[str] = None,
+        settle_coin: Optional[str] = None,
+        refresh_interval: Optional[float] = None,
+        strategy_name: Optional[str] = None,
+        limit: Optional[int] = None,
+        strategy_config: Optional[SymbolStrategyConfig] = None,
     ) -> None:
+        config = strategy_config or maybe_load_symbol_strategy_config()
+
+        self._category = (
+            category
+            or (config.category if config else None)
+            or DEFAULT_CATEGORY
+        )
+        self._settle_coin = (
+            settle_coin
+            or (config.settle_coin if config else None)
+            or DEFAULT_SETTLE_COIN
+        )
+        self.refresh_interval = (
+            refresh_interval
+            if refresh_interval is not None
+            else (config.refresh_interval if config else None)
+        ) or DEFAULT_DISCOVERY_INTERVAL
+        self._strategy_name = (
+            strategy_name
+            or (config.strategy if config else None)
+            or "top_volume"
+        )
+        self._limit = (
+            limit if limit is not None else (config.limit if config else None)
+        ) or DEFAULT_SYMBOL_LIMIT
+
         self._client = client or build_client()
-        self._store = store or DiscoveredSymbolStore()
-        self._category = category
-        self._settle_coin = settle_coin
-        self.refresh_interval = refresh_interval
+        self._store = store or DiscoveredSymbolStore(max_symbols=self._limit)
+        if store is not None and hasattr(store, "max_symbols"):
+            try:
+                store.max_symbols = self._limit
+            except (AttributeError, ValueError):
+                logger.debug("Failed to set store max_symbols to %s", self._limit)
+        self._finder: SymbolFinder = create_symbol_finder(
+            self._strategy_name,
+            self._client,
+            category=self._category,
+            settle_coin=self._settle_coin,
+            limit=self._limit,
+        )
 
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
@@ -46,9 +91,16 @@ class SymbolDiscoveryStrategy:
     def store(self) -> DiscoveredSymbolStore:
         return self._store
 
+    @property
+    def strategy_name(self) -> str:
+        return self._strategy_name
+
+    @property
+    def limit(self) -> int:
+        return self._limit
+
     def fetch_once(self) -> list[str]:
-        response = self._client.get_symbols(category=self._category)
-        candidates = self._filter_symbols(response)
+        candidates = self._finder.fetch()
         updated = self._store.update(candidates)
         logger.debug("Discovered symbols updated: %s", updated)
         return updated
@@ -72,10 +124,12 @@ class SymbolDiscoveryStrategy:
 
     def _run(self) -> None:
         logger.info(
-            "Starting symbol discovery thread: interval=%ss category=%s settleCoin=%s",
+            "Starting symbol discovery thread: interval=%ss category=%s settleCoin=%s strategy=%s limit=%s",
             self.refresh_interval,
             self._category,
             self._settle_coin,
+            self._strategy_name,
+            self._limit,
         )
         while not self._stop_event.is_set():
             start = time.perf_counter()
@@ -88,18 +142,3 @@ class SymbolDiscoveryStrategy:
             if self._stop_event.wait(wait_time):
                 break
         logger.info("Symbol discovery thread stopped")
-
-    def _filter_symbols(self, payload: dict[str, Any]) -> list[str]:
-        result = payload.get("result") or {}
-        instruments = result.get("list") or []
-        selected: list[str] = []
-        for item in instruments:
-            if item.get("status") != "Trading":
-                continue
-            if item.get("settleCoin") != self._settle_coin:
-                continue
-            symbol = item.get("symbol")
-            if not symbol:
-                continue
-            selected.append(symbol.upper())
-        return selected

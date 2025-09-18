@@ -17,7 +17,13 @@ from src.config.account_config import (  # noqa: E402  pylint: disable=wrong-imp
     maybe_load_account_config,
     resolve_config_path,
 )
+from src.config import (  # noqa: E402  pylint: disable=wrong-import-position
+    maybe_load_symbol_strategy_config,
+)
 from src.data import WalletDataManager  # noqa: E402  pylint: disable=wrong-import-position
+from src.data.symbol import (  # noqa: E402  pylint: disable=wrong-import-position
+    SymbolDiscoveryStrategy,
+)
 from src.exchange.bybit_v5 import BybitV5Client  # noqa: E402  pylint: disable=wrong-import-position
 
 logger = logging.getLogger("smpStrategy")
@@ -58,6 +64,27 @@ def main() -> None:
         snapshot.available_balance,
         snapshot.wallet_balance,
     )
+    strategy_config = maybe_load_symbol_strategy_config()
+    discovery = SymbolDiscoveryStrategy(
+        client=client,
+        strategy_config=strategy_config,
+    )
+    try:
+        symbols = discovery.fetch_once()
+        if symbols:
+            logger.info(
+                "Discovered symbols (%s, limit=%s): %s",
+                discovery.strategy_name,
+                discovery.limit,
+                ", ".join(symbols),
+            )
+        else:
+            logger.warning(
+                "Symbol discovery (%s) returned no symbols.",
+                discovery.strategy_name,
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Symbol discovery failed: %s", exc)
     # TODO: Extend with the actual trading strategy logic.
 
 

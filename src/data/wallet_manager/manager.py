@@ -3,6 +3,7 @@ from __future__ import annotations
 """Utilities for polling Bybit wallet balances on a fixed interval."""
 
 import logging
+import os
 import threading
 import time
 from dataclasses import dataclass
@@ -10,9 +11,9 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from src.config.account_config import maybe_load_account_config, resolve_config_path
+from src.config.wallet_config import maybe_load_wallet_config
+from src.data.wallet_manager.constants import DEFAULT_REFRESH_INTERVAL
 from src.exchange.bybit_v5 import BybitV5Client
-
-DEFAULT_REFRESH_INTERVAL = 15.0  # seconds
 
 logger = logging.getLogger("smpStrategy.wallet")
 
@@ -37,7 +38,8 @@ class WalletDataManager:
         client: Optional[BybitV5Client] = None,
         account_type: str = "UNIFIED",
         coin: str = "USDT",
-        refresh_interval: float = DEFAULT_REFRESH_INTERVAL,
+        refresh_interval: Optional[float] = None,
+        wallet_config_path: str | os.PathLike[str] | None = None,
     ) -> None:
         if client is None:
             config = maybe_load_account_config()
@@ -56,7 +58,12 @@ class WalletDataManager:
         self._client = client
         self._account_type = account_type
         self._coin = coin
-        self.refresh_interval = refresh_interval
+
+        if refresh_interval is None:
+            wallet_config = maybe_load_wallet_config(wallet_config_path)
+            if wallet_config is not None:
+                refresh_interval = wallet_config.refresh_interval
+        self.refresh_interval = refresh_interval or DEFAULT_REFRESH_INTERVAL
 
         self._snapshot_lock = threading.Lock()
         self._snapshot: Optional[WalletSnapshot] = None

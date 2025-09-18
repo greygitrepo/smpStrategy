@@ -1,6 +1,7 @@
 """Wallet manager utilities."""
 
-from .manager import DEFAULT_REFRESH_INTERVAL, WalletDataManager, WalletSnapshot
+from .constants import DEFAULT_REFRESH_INTERVAL
+from .manager import WalletDataManager, WalletSnapshot
 
 __all__ = [
     "DEFAULT_REFRESH_INTERVAL",
