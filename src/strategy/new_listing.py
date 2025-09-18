@@ -135,6 +135,11 @@ class NewListingTradingStrategy:
                     max_new_positions,
                 )
                 break
+            logger.debug(
+                "Attempting entry for %s with remaining_margin=%.6f",
+                symbol,
+                remaining_margin,
+            )
             try:
                 entry = self._evaluate_symbol(symbol, remaining_margin)
             except Exception as exc:  # noqa: BLE001 - log and continue per symbol
@@ -151,10 +156,11 @@ class NewListingTradingStrategy:
             active_symbols.add(symbol)
             new_positions_opened += 1
             logger.info(
-                "Order placed for %s using notional=%.6f (margin_used=%.6f); remaining_margin=%.6f",
+                "Order placed for %s using notional=%.6f (margin_used=%.6f leverage=%s); remaining_margin=%.6f",
                 symbol,
                 notional_used,
                 margin_used,
+                self._config.leverage,
                 remaining_margin,
             )
             if remaining_margin <= 0:
@@ -320,7 +326,10 @@ class NewListingTradingStrategy:
         if trend is None:
             logger.info("Trend indeterminate for %s; no position taken", symbol)
             return None
+        logger.debug("Trend for %s resolved to %s", symbol, trend)
         entry = self._attempt_entry(symbol, trend, available, timeframe_data)
+        if entry is None:
+            logger.debug("Entry attempt for %s returned no trade", symbol)
         return entry
 
     def _collect_timeframe_data(
@@ -343,6 +352,12 @@ class NewListingTradingStrategy:
                 available_60,
             )
             return None
+        logger.debug(
+            "Requirement '%s' selected for %s (available_60=%s)",
+            requirement.name,
+            symbol,
+            available_60,
+        )
         candles_60 = candles_60[-max(requirement.min_60m, self._config.ema_period + 1) :]
         candles_30 = self._fetch_candles(
             symbol,
@@ -561,6 +576,16 @@ class NewListingTradingStrategy:
         desired_notional = desired_margin * leverage
         target_notional = max(min_notional, desired_notional)
         target_notional = min(target_notional, max_affordable_notional)
+        logger.debug(
+            "%s sizing: price=%.6f leverage=%.2f min_notional=%.6f desired_notional=%.6f max_affordable=%.6f target_notional=%.6f",
+            symbol,
+            last_close,
+            leverage,
+            min_notional,
+            desired_notional,
+            max_affordable_notional,
+            target_notional,
+        )
         if target_notional < min_notional:
             logger.info(
                 "Skipping %s because computed notional %.6f is below exchange minimum %.6f",
@@ -584,6 +609,13 @@ class NewListingTradingStrategy:
             )
             return None
         margin_required = notional / leverage
+        logger.debug(
+            "%s final sizing: qty=%.8f notional=%.6f margin_required=%.6f",
+            symbol,
+            qty,
+            notional,
+            margin_required,
+        )
         if margin_required > available:
             logger.debug(
                 "Margin required %.6f exceeds available %.6f for %s",
@@ -641,6 +673,11 @@ class NewListingTradingStrategy:
                 qty = max_steps * qty_step
             else:
                 qty = max_notional / last_close
+            logger.debug(
+                "Adjusted quantity to fit max_notional: qty=%.8f max_notional=%.6f",
+                qty,
+                max_notional,
+            )
         if qty <= 0:
             return None
         if qty < min_qty:
