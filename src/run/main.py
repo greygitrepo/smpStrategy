@@ -22,6 +22,9 @@ from src.config import (  # noqa: E402  pylint: disable=wrong-import-position
 )
 from src.data import WalletDataManager  # noqa: E402  pylint: disable=wrong-import-position
 from src.data.symbol import (  # noqa: E402  pylint: disable=wrong-import-position
+    ActivePositionTracker,
+    DEFAULT_CATEGORY,
+    DEFAULT_SETTLE_COIN,
     SymbolDiscoveryStrategy,
 )
 from src.exchange.bybit_v5 import BybitV5Client  # noqa: E402  pylint: disable=wrong-import-position
@@ -65,6 +68,40 @@ def main() -> None:
         snapshot.wallet_balance,
     )
     strategy_config = maybe_load_symbol_strategy_config()
+    category = (
+        strategy_config.category
+        if strategy_config and strategy_config.category
+        else getattr(client, "default_category", DEFAULT_CATEGORY)
+    )
+    settle_coin = (
+        strategy_config.settle_coin
+        if strategy_config and strategy_config.settle_coin
+        else DEFAULT_SETTLE_COIN
+    )
+    position_tracker = ActivePositionTracker(
+        client=client,
+        category=category,
+        settle_coin=settle_coin,
+    )
+    positions = position_tracker.positions()
+    if positions:
+        for symbol, pos in positions.items():
+            logger.info(
+                "Open position %s: side=%s size=%s entry_price=%s leverage=%s unrealized_pnl=%s pnl_rate=%s%%",
+                symbol,
+                pos.side,
+                pos.size,
+                pos.entry_price,
+                pos.leverage,
+                pos.unrealized_pnl,
+                f"{pos.pnl_rate:.2f}",
+            )
+    else:
+        logger.info(
+            "No open positions detected: category=%s settle_coin=%s",
+            category,
+            settle_coin,
+        )
     discovery = SymbolDiscoveryStrategy(
         client=client,
         strategy_config=strategy_config,
