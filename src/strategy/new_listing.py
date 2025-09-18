@@ -120,7 +120,7 @@ class NewListingTradingStrategy:
             available,
         )
         active_symbols = {sym.upper() for sym in positions}
-        remaining_available = available
+        remaining_margin = available
         new_positions_opened = 0
         max_new_positions = self._config.max_new_positions
         for idx, symbol in enumerate(symbols):
@@ -136,27 +136,29 @@ class NewListingTradingStrategy:
                 )
                 break
             try:
-                notional_used = self._evaluate_symbol(symbol, remaining_available)
+                entry = self._evaluate_symbol(symbol, remaining_margin)
             except Exception as exc:  # noqa: BLE001 - log and continue per symbol
                 logger.exception("Failed to evaluate symbol %s: %s", symbol, exc)
                 continue
-            if notional_used is None:
+            if entry is None:
                 # None indicates that evaluation aborted without a decision
                 continue
-            if notional_used <= 0:
+            notional_used, margin_used = entry
+            if notional_used <= 0 or margin_used <= 0:
                 logger.debug("No order placed for %s", symbol)
                 continue
-            remaining_available = max(0.0, remaining_available - notional_used)
+            remaining_margin = max(0.0, remaining_margin - margin_used)
             active_symbols.add(symbol)
             new_positions_opened += 1
             logger.info(
-                "Order placed for %s using approx notional=%s; remaining_available=%s",
+                "Order placed for %s using notional=%.6f (margin_used=%.6f); remaining_margin=%.6f",
                 symbol,
                 notional_used,
-                remaining_available,
+                margin_used,
+                remaining_margin,
             )
-            if remaining_available <= 0:
-                logger.info("Reached capital allocation limit; stopping evaluation loop")
+            if remaining_margin <= 0:
+                logger.info("Reached capital allocation margin limit; stopping evaluation loop")
                 break
 
     # ----- Position management helpers -----
@@ -304,10 +306,10 @@ class NewListingTradingStrategy:
         self,
         symbol: str,
         available: float,
-    ) -> Optional[float]:
+    ) -> Optional[tuple[float, float]]:
         if available <= 0:
             logger.debug("Skipping %s because available balance is exhausted", symbol)
-            return 0.0
+            return None
         timeframe_data = self._collect_timeframe_data(symbol)
         if timeframe_data is None:
             return None
@@ -317,9 +319,9 @@ class NewListingTradingStrategy:
         trend = self._determine_trend(symbol, timeframe_data)
         if trend is None:
             logger.info("Trend indeterminate for %s; no position taken", symbol)
-            return 0.0
-        order_notional = self._attempt_entry(symbol, trend, available, timeframe_data)
-        return order_notional
+            return None
+        entry = self._attempt_entry(symbol, trend, available, timeframe_data)
+        return entry
 
     def _collect_timeframe_data(
         self,
@@ -524,45 +526,76 @@ class NewListingTradingStrategy:
         trend: str,
         available: float,
         timeframe_data: dict[str, list[Candle]],
-    ) -> float:
+    ) -> Optional[tuple[float, float]]:
         direction = trend.lower()
         if direction not in {"long", "short"}:
             logger.debug("Unknown trend signal for %s: %s", symbol, trend)
-            return 0.0
+            return None
         last_close = timeframe_data.get("5m")[-1].close if timeframe_data.get("5m") else None
         if last_close is None or last_close <= 0:
             logger.debug("Missing last close for %s; aborting order", symbol)
-            return 0.0
+            return None
         instrument = self._load_instrument_details(symbol)
         if instrument is None:
             logger.debug("Instrument metadata missing for %s", symbol)
-            return 0.0
+            return None
         min_qty = instrument["min_qty"]
         qty_step = instrument["qty_step"]
         max_qty = instrument.get("max_qty", 0.0)
-        min_notional = min_qty * last_close
+        leverage = max(self._config.leverage, 1.0)
+        min_order_value = instrument.get("min_order_value", 0.0) or 5.0
+        min_notional = max(min_qty * last_close, min_order_value)
         if min_notional <= 0:
             logger.debug("Invalid min notional for %s (min_qty=%s last_close=%s)", symbol, min_qty, last_close)
-            return 0.0
-        if available < min_notional:
+            return None
+        max_affordable_notional = available * leverage
+        if max_affordable_notional < min_notional:
             logger.info(
-                "Skipping %s because available=%s < min_notional=%s",
+                "Skipping %s because max_affordable_notional=%.6f < min_notional=%.6f",
                 symbol,
-                available,
+                max_affordable_notional,
                 min_notional,
             )
-            return 0.0
-        target_notional = max(min_notional, available * self._config.allocation_pct)
-        target_notional = min(target_notional, available)
+            return None
+        desired_margin = available * self._config.allocation_pct
+        desired_notional = desired_margin * leverage
+        target_notional = max(min_notional, desired_notional)
+        target_notional = min(target_notional, max_affordable_notional)
+        if target_notional < min_notional:
+            logger.info(
+                "Skipping %s because computed notional %.6f is below exchange minimum %.6f",
+                symbol,
+                target_notional,
+                min_notional,
+            )
+            return None
         desired_qty = target_notional / last_close
-        qty = self._quantize_quantity(desired_qty, min_qty, qty_step, max_qty, available, last_close)
-        if qty is None or qty <= 0 or qty * last_close < min_notional:
+        qty = self._quantize_quantity(desired_qty, min_qty, qty_step, max_qty, max_affordable_notional, last_close)
+        if qty is None or qty <= 0:
             logger.debug("Quantized quantity insufficient for %s (qty=%s)", symbol, qty)
-            return 0.0
+            return None
+        notional = qty * last_close
+        if notional < min_notional:
+            logger.debug(
+                "Quantized notional %.6f is below minimum %.6f for %s",
+                notional,
+                min_notional,
+                symbol,
+            )
+            return None
+        margin_required = notional / leverage
+        if margin_required > available:
+            logger.debug(
+                "Margin required %.6f exceeds available %.6f for %s",
+                margin_required,
+                available,
+                symbol,
+            )
+            return None
         side = "Buy" if direction == "long" else "Sell"
         if not self._ensure_leverage(symbol):
             logger.error("Aborting entry for %s because leverage configuration failed", symbol)
-            return 0.0
+            return None
         try:
             response = self._client.place_order(
                 symbol=symbol,
@@ -573,12 +606,12 @@ class NewListingTradingStrategy:
                 category=self._category,
             )
             logger.debug("Order response for %s: %s", symbol, response)
-            return qty * last_close
+            return notional, margin_required
         except BybitAPIError as api_exc:
             logger.error("Bybit API rejected entry for %s: %s", symbol, api_exc)
         except Exception as exc:  # noqa: BLE001
             logger.exception("Unexpected error during order submission for %s: %s", symbol, exc)
-        return 0.0
+        return None
 
     def _quantize_quantity(
         self,
@@ -586,7 +619,7 @@ class NewListingTradingStrategy:
         min_qty: float,
         qty_step: float,
         max_qty: float,
-        available: float,
+        max_notional: float,
         last_close: float,
     ) -> Optional[float]:
         qty = max(desired_qty, min_qty)
@@ -602,12 +635,12 @@ class NewListingTradingStrategy:
         if max_qty and max_qty > 0:
             qty = min(qty, max_qty)
         notional = qty * last_close
-        if notional > available:
+        if notional > max_notional:
             if qty_step > 0:
-                max_steps = math.floor((available / last_close) / qty_step)
+                max_steps = math.floor((max_notional / last_close) / qty_step)
                 qty = max_steps * qty_step
             else:
-                qty = available / last_close
+                qty = max_notional / last_close
         if qty <= 0:
             return None
         if qty < min_qty:
@@ -635,6 +668,7 @@ class NewListingTradingStrategy:
                 qty_step = float(lot.get("qtyStep", 0) or 0)
                 max_qty = float(lot.get("maxOrderQty", 0) or 0)
                 tick_size = float(price.get("tickSize", 0) or 0)
+                min_order_value = float(lot.get("minOrderValue", 0) or 0)
             except (TypeError, ValueError):
                 logger.debug("Failed to parse lot/price filter for %s: %s", symbol, item)
                 return None
@@ -645,6 +679,7 @@ class NewListingTradingStrategy:
                 "qty_step": qty_step,
                 "max_qty": max_qty,
                 "tick_size": tick_size,
+                "min_order_value": min_order_value,
             }
         logger.debug("Instrument info not found for %s", symbol)
         return None
@@ -669,6 +704,10 @@ class NewListingTradingStrategy:
                 category=self._category,
             )
         except BybitAPIError as api_exc:
+            if getattr(api_exc, "ret_code", None) == 110043:
+                logger.info("Leverage already set to %.2f for %s", leverage, key)
+                self._leverage_cache.add(key)
+                return True
             logger.error("Failed to set leverage %.2f for %s: %s", leverage, key, api_exc)
             return False
         except Exception as exc:  # noqa: BLE001

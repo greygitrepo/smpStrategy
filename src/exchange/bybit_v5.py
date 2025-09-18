@@ -221,8 +221,10 @@ class BybitV5Client:
         if not force and (now - self._time_sync_last) < self._time_sync_interval:
             return
         start = time.time()
+        endpoint = f"{self.base_url}/v5/market/time"
+        params: Dict[str, Any] | None = None
         try:
-            resp = self._client.get(f"{self.base_url}/v5/public/time")
+            resp = self._client.get(endpoint, params=params)
             payload = resp.json()
         except Exception:
             return
@@ -289,6 +291,9 @@ class BybitV5Client:
             clean_params: Dict[str, Any] | None = None
             clean_data: Dict[str, Any] | None = None
             payload_for_sign = ""
+            request_params = params
+            request_json = data
+            request_content: str | None = None
             if auth:
                 if method.upper() in {"GET", "DELETE"}:
                     # Exclude None values from query params for both signing and sending
@@ -299,6 +304,7 @@ class BybitV5Client:
                     else:
                         clean_params = None
                     payload_for_sign = self._canonical_query(clean_params)
+                    request_params = clean_params
                 else:
                     # Exclude None values from body for both signing and sending
                     if data:
@@ -306,6 +312,10 @@ class BybitV5Client:
                     else:
                         clean_data = None
                     payload_for_sign = self._minified_json(clean_data)
+                    request_json = None
+                    request_content = payload_for_sign or ""
+                    if not request_content:
+                        request_content = None
                 headers.update(
                     {
                         "X-BAPI-API-KEY": self.api_key,
@@ -322,8 +332,9 @@ class BybitV5Client:
                 resp = self._client.request(
                     method,
                     url,
-                    params=(clean_params if auth else params),
-                    json=(clean_data if auth else data),
+                    params=request_params,
+                    json=None if request_content is not None else request_json,
+                    content=request_content,
                     headers=headers,
                 )
             except httpx.RequestError:
