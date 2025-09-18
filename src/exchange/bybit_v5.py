@@ -127,7 +127,18 @@ class BybitV5Client:
         self.base_url = base_url or (
             DEFAULT_BASE_TESTNET if testnet else DEFAULT_BASE_MAINNET
         )
+        recv_window_override = os.environ.get("BYBIT_RECV_WINDOW_MS")
+        if recv_window_override:
+            try:
+                recv_window_ms = max(1000, int(recv_window_override))
+            except ValueError:
+                pass
         self.recv_window_ms = recv_window_ms
+        self._time_offset_ms = 0.0
+        self._time_sync_last = 0.0
+        self._time_sync_interval = float(
+            os.environ.get("BYBIT_TIME_SYNC_INTERVAL", "120")
+        )
         # Configure granular timeouts to avoid long hangs on CI/public edges
         try:
             timeout_obj = httpx.Timeout(connect=5.0, read=7.0, write=5.0, pool=5.0)
@@ -202,6 +213,47 @@ class BybitV5Client:
         ).hexdigest()
         return sig
 
+    def _current_timestamp_ms(self) -> int:
+        return int((time.time() + (self._time_offset_ms / 1000.0)) * 1000)
+
+    def _sync_time_offset(self, *, force: bool = False) -> None:
+        now = time.time()
+        if not force and (now - self._time_sync_last) < self._time_sync_interval:
+            return
+        start = time.time()
+        try:
+            resp = self._client.get(f"{self.base_url}/v5/public/time")
+            payload = resp.json()
+        except Exception:
+            return
+        server_ms: int | None = None
+        if isinstance(payload, dict):
+            try:
+                server_ms = int(payload.get("time"))  # type: ignore[arg-type]
+            except Exception:
+                result = payload.get("result") if isinstance(payload.get("result"), dict) else None
+                if isinstance(result, dict):
+                    for key in ("timeNano", "timeSecond", "time"):
+                        value = result.get(key)
+                        if value is None:
+                            continue
+                        try:
+                            server_ms = int(str(value))
+                        except Exception:
+                            continue
+                        else:
+                            if key == "timeNano":
+                                server_ms //= 1_000_000
+                            elif key == "timeSecond":
+                                server_ms *= 1000
+                            break
+        if server_ms is None:
+            return
+        end = time.time()
+        midpoint_ms = int(((start + end) / 2) * 1000)
+        self._time_offset_ms = server_ms - midpoint_ms
+        self._time_sync_last = end
+
     # -------- Core request --------
     def _request(
         self,
@@ -214,17 +266,20 @@ class BybitV5Client:
         max_retries: int = 2,
     ) -> Dict[str, Any]:
         url = f"{self.base_url}{path}"
-        headers: Dict[str, str] = {
+        base_headers: Dict[str, str] = {
             "Content-Type": "application/json",
             "Accept": "application/json",
             # Some Bybit edges return non-JSON without UA; set a stable UA
             "User-Agent": "cdx-trading-bot/1.0 (+httpx)",
         }
-        ts_ms = int(time.time() * 1000)
         start_ts = time.time()
         total_timeout = float(os.environ.get("BYBIT_HTTP_TOTAL_TIMEOUT", "20"))
         attempt = 0
+        if auth:
+            self._sync_time_offset()
         while True:
+            headers: Dict[str, str] = dict(base_headers)
+            ts_ms = self._current_timestamp_ms()
             # Total elapsed guard
             if (time.time() - start_ts) > total_timeout:
                 raise BybitAPIError(
@@ -314,10 +369,17 @@ class BybitV5Client:
             ret_code = j.get("retCode", 0)
             if ret_code != 0:
                 # Retry on transient codes, else raise
-                if attempt < max_retries and ret_code in {10006, 10016, 10018, 110001}:
-                    time.sleep(2**attempt)
-                    attempt += 1
-                    continue
+                if attempt < max_retries:
+                    if ret_code in {10006, 10016, 10018, 110001}:
+                        time.sleep(2**attempt)
+                        attempt += 1
+                        continue
+                    if ret_code == 10002:
+                        self._sync_time_offset(force=True)
+                        if self.recv_window_ms < 10000:
+                            self.recv_window_ms = 10000
+                        attempt += 1
+                        continue
                 raise BybitAPIError(ret_code, j.get("retMsg", "unknown"), j)
             return j
 

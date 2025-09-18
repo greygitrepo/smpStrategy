@@ -7,10 +7,9 @@ import threading
 import time
 from typing import TYPE_CHECKING, Optional
 
-from src.config.symbol_strategy_config import (
-    SymbolStrategyConfig,
-    maybe_load_symbol_strategy_config,
-)
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from src.config.symbol_strategy_config import SymbolStrategyConfig
+    from src.exchange.bybit_v5 import BybitV5Client
 
 from .client import build_client
 from .constants import (
@@ -24,9 +23,11 @@ from .strategies import SymbolFinder, create_symbol_finder
 
 logger = logging.getLogger("smpStrategy.symbol.discovery")
 
-if TYPE_CHECKING:  # pragma: no cover - typing only
-    from src.exchange.bybit_v5 import BybitV5Client
 
+def _maybe_load_symbol_strategy_config() -> Optional["SymbolStrategyConfig"]:
+    from src.config.symbol_strategy_config import maybe_load_symbol_strategy_config
+
+    return maybe_load_symbol_strategy_config()
 
 class SymbolDiscoveryStrategy:
     """Fetch and maintain candidate symbols suitable for USDT perpetual trading."""
@@ -41,9 +42,9 @@ class SymbolDiscoveryStrategy:
         refresh_interval: Optional[float] = None,
         strategy_name: Optional[str] = None,
         limit: Optional[int] = None,
-        strategy_config: Optional[SymbolStrategyConfig] = None,
+        strategy_config: Optional["SymbolStrategyConfig"] = None,
     ) -> None:
-        config = strategy_config or maybe_load_symbol_strategy_config()
+        config = strategy_config or _maybe_load_symbol_strategy_config()
 
         self._category = (
             category

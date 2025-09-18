@@ -1,0 +1,12 @@
+
+config/accountConfig.ini
+
+src/config/__pycache__/
+
+src/data/__pycache__/
+
+src/exchange/__pycache__/
+
+src/data/symbol/__pycache__/
+
+src/data/wallet_manager/__pycache__/
