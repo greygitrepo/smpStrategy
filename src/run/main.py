@@ -43,7 +43,7 @@ def _setup_logging() -> Path:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_file = log_dir / f"smpStrategy_{timestamp}.log"
     logging.basicConfig(
-        level=logging.INFO,
+        level=logging.DEBUG,
         format="%(asctime)s %(levelname)s %(name)s - %(message)s",
         handlers=[
             logging.StreamHandler(sys.stdout),

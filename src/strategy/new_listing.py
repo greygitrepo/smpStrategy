@@ -657,7 +657,7 @@ class NewListingTradingStrategy:
         qty = max(desired_qty, min_qty)
         if qty_step > 0:
             min_steps = math.ceil(min_qty / qty_step)
-            steps = max(math.floor(qty / qty_step), min_steps)
+            steps = max(math.ceil(qty / qty_step), min_steps)
             qty = steps * qty_step
             min_qty_aligned = max(min_qty, min_steps * qty_step)
         else:
@@ -678,9 +678,12 @@ class NewListingTradingStrategy:
                 qty,
                 max_notional,
             )
+            notional = qty * last_close
         if qty <= 0:
             return None
         if qty < min_qty:
+            return None
+        if notional <= 0:
             return None
         return qty
 
