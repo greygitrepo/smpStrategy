@@ -130,21 +130,6 @@ class NewListingTradingStrategy:
             logger.debug("No eligible symbols after filtering; skipping entry evaluation")
             return
         allocation_fraction = max(0.0, self._config.allocation_pct)
-        per_slot_margin = remaining_margin * allocation_fraction
-        total_desired_margin = per_slot_margin * max_considered_slots
-        if total_desired_margin > remaining_margin and total_desired_margin > 0:
-            scale = remaining_margin / total_desired_margin
-            per_slot_margin *= scale
-        if max_considered_slots > 0:
-            per_slot_margin = min(per_slot_margin, remaining_margin / max_considered_slots)
-        per_slot_margin = max(0.0, per_slot_margin)
-        logger.debug(
-            "Per-slot margin target=%.6f across %s slots (available=%.6f allocation_pct=%.6f)",
-            per_slot_margin,
-            max_considered_slots,
-            remaining_margin,
-            allocation_fraction,
-        )
         new_positions_opened = 0
         for idx, symbol in enumerate(symbols):
             symbol = symbol.upper()
@@ -158,6 +143,20 @@ class NewListingTradingStrategy:
                     open_slots,
                 )
                 break
+            slots_remaining = max_considered_slots - new_positions_opened
+            if slots_remaining <= 0:
+                logger.debug("No slots remaining after updates; breaking out")
+                break
+            per_slot_margin = remaining_margin * allocation_fraction
+            per_slot_margin = min(per_slot_margin, remaining_margin / slots_remaining)
+            per_slot_margin = max(0.0, per_slot_margin)
+            logger.debug(
+                "Slot margin target for %s: %.6f (remaining=%.6f slots_left=%s)",
+                symbol,
+                per_slot_margin,
+                remaining_margin,
+                slots_remaining,
+            )
             logger.debug(
                 "Attempting entry for %s with remaining_margin=%.6f",
                 symbol,
@@ -389,12 +388,11 @@ class NewListingTradingStrategy:
         available: float,
         margin_cap: float,
     ) -> Optional[tuple[float, float]]:
-        if available <= 0 or margin_cap <= 0:
+        if available <= 0:
             logger.debug("Skipping %s because available balance is exhausted", symbol)
             return None
-        effective_margin = min(available, margin_cap)
-        if effective_margin <= 0:
-            logger.debug("Skipping %s because effective margin is non-positive", symbol)
+        if margin_cap <= 0:
+            logger.debug("Skipping %s because margin cap is non-positive", symbol)
             return None
         timeframe_data = self._collect_timeframe_data(symbol)
         if timeframe_data is None:
@@ -407,7 +405,7 @@ class NewListingTradingStrategy:
             logger.info("Trend indeterminate for %s; no position taken", symbol)
             return None
         logger.debug("Trend for %s resolved to %s", symbol, trend)
-        entry = self._attempt_entry(symbol, trend, effective_margin, timeframe_data)
+        entry = self._attempt_entry(symbol, trend, available, margin_cap, timeframe_data)
         if entry is None:
             logger.debug("Entry attempt for %s returned no trade", symbol)
         return entry
@@ -619,6 +617,7 @@ class NewListingTradingStrategy:
         self,
         symbol: str,
         trend: str,
+        available: float,
         margin_cap: float,
         timeframe_data: dict[str, list[Candle]],
     ) -> Optional[tuple[float, float]]:
@@ -626,8 +625,8 @@ class NewListingTradingStrategy:
         if direction not in {"long", "short"}:
             logger.debug("Unknown trend signal for %s: %s", symbol, trend)
             return None
-        if margin_cap <= 0:
-            logger.debug("Margin cap exhausted for %s; skipping entry", symbol)
+        if available <= 0:
+            logger.debug("Available margin exhausted for %s; skipping entry", symbol)
             return None
         last_close = timeframe_data.get("5m")[-1].close if timeframe_data.get("5m") else None
         if last_close is None or last_close <= 0:
@@ -646,19 +645,28 @@ class NewListingTradingStrategy:
         if min_notional <= 0:
             logger.debug("Invalid min notional for %s (min_qty=%s last_close=%s)", symbol, min_qty, last_close)
             return None
-        max_affordable_notional = margin_cap * leverage
-        if max_affordable_notional < min_notional:
+        available_margin = max(0.0, available)
+        min_margin_required = min_notional / leverage if leverage > 0 else min_notional
+        if available_margin < min_margin_required:
             logger.info(
-                "Skipping %s because margin cap %.6f (notional=%.6f) is below exchange minimum %.6f",
+                "Skipping %s because available margin %.6f is below minimum required %.6f",
                 symbol,
-                margin_cap,
-                max_affordable_notional,
-                min_notional,
+                available_margin,
+                min_margin_required,
             )
             return None
-        planned_notional = margin_cap * leverage
-        target_notional = min(planned_notional, max_affordable_notional)
-        target_notional = max(min_notional, target_notional)
+        budget_margin = max(margin_cap, min_margin_required)
+        if budget_margin > available_margin:
+            budget_margin = available_margin
+        if budget_margin > margin_cap + 1e-8 and margin_cap > 0:
+            logger.debug(
+                "Adjusted margin target for %s from %.6f to %.6f to satisfy minimum order",
+                symbol,
+                margin_cap,
+                budget_margin,
+            )
+        planned_notional = budget_margin * leverage
+        target_notional = max(min_notional, planned_notional)
         logger.debug(
             "%s sizing: price=%.6f leverage=%.2f min_notional=%.6f planned_notional=%.6f max_affordable=%.6f target_notional=%.6f",
             symbol,
@@ -666,7 +674,7 @@ class NewListingTradingStrategy:
             leverage,
             min_notional,
             planned_notional,
-            max_affordable_notional,
+            budget_margin * leverage,
             target_notional,
         )
         if target_notional < min_notional:
@@ -678,7 +686,7 @@ class NewListingTradingStrategy:
             )
             return None
         desired_qty = target_notional / last_close
-        qty = self._quantize_quantity(desired_qty, min_qty, qty_step, max_qty, max_affordable_notional, last_close)
+        qty = self._quantize_quantity(desired_qty, min_qty, qty_step, max_qty, budget_margin * leverage, last_close)
         if qty is None or qty <= 0:
             logger.debug("Quantized quantity insufficient for %s (qty=%s)", symbol, qty)
             return None
@@ -699,11 +707,11 @@ class NewListingTradingStrategy:
             notional,
             margin_required,
         )
-        if margin_required - margin_cap > 1e-8:
+        if margin_required - available_margin > 1e-8:
             logger.debug(
-                "Margin required %.6f exceeds margin cap %.6f for %s",
+                "Margin required %.6f exceeds available margin %.6f for %s",
                 margin_required,
-                margin_cap,
+                available_margin,
                 symbol,
             )
             return None
