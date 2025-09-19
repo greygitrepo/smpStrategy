@@ -646,6 +646,7 @@ class NewListingTradingStrategy:
             logger.debug("Invalid min notional for %s (min_qty=%s last_close=%s)", symbol, min_qty, last_close)
             return None
         available_margin = max(0.0, available)
+        max_affordable_notional = available_margin * leverage
         min_margin_required = min_notional / leverage if leverage > 0 else min_notional
         if available_margin < min_margin_required:
             logger.info(
@@ -666,7 +667,7 @@ class NewListingTradingStrategy:
                 budget_margin,
             )
         planned_notional = budget_margin * leverage
-        target_notional = max(min_notional, planned_notional)
+        target_notional = max(min_notional, min(planned_notional, max_affordable_notional))
         logger.debug(
             "%s sizing: price=%.6f leverage=%.2f min_notional=%.6f planned_notional=%.6f max_affordable=%.6f target_notional=%.6f",
             symbol,
@@ -674,7 +675,7 @@ class NewListingTradingStrategy:
             leverage,
             min_notional,
             planned_notional,
-            budget_margin * leverage,
+            max_affordable_notional,
             target_notional,
         )
         if target_notional < min_notional:
@@ -686,7 +687,14 @@ class NewListingTradingStrategy:
             )
             return None
         desired_qty = target_notional / last_close
-        qty = self._quantize_quantity(desired_qty, min_qty, qty_step, max_qty, budget_margin * leverage, last_close)
+        qty = self._quantize_quantity(
+            desired_qty,
+            min_qty,
+            qty_step,
+            max_qty,
+            max_affordable_notional,
+            last_close,
+        )
         if qty is None or qty <= 0:
             logger.debug("Quantized quantity insufficient for %s (qty=%s)", symbol, qty)
             return None
@@ -700,14 +708,7 @@ class NewListingTradingStrategy:
             )
             return None
         margin_required = notional / leverage
-        logger.debug(
-            "%s final sizing: qty=%.8f notional=%.6f margin_required=%.6f",
-            symbol,
-            qty,
-            notional,
-            margin_required,
-        )
-        if margin_required - available_margin > 1e-8:
+        if margin_required > available_margin + 1e-8:
             logger.debug(
                 "Margin required %.6f exceeds available margin %.6f for %s",
                 margin_required,
@@ -715,6 +716,20 @@ class NewListingTradingStrategy:
                 symbol,
             )
             return None
+        if margin_required > budget_margin + 1e-8:
+            logger.debug(
+                "Margin usage for %s expanded above slot target %.6f -> %.6f",
+                symbol,
+                budget_margin,
+                margin_required,
+            )
+        logger.debug(
+            "%s final sizing: qty=%.8f notional=%.6f margin_required=%.6f",
+            symbol,
+            qty,
+            notional,
+            margin_required,
+        )
         side = "Buy" if direction == "long" else "Sell"
         if not self._ensure_leverage(symbol):
             logger.error("Aborting entry for %s because leverage configuration failed", symbol)
