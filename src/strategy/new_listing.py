@@ -5,9 +5,8 @@ from __future__ import annotations
 import json
 import logging
 import math
-from collections import deque
+import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -25,8 +24,6 @@ from src.exchange.bybit_v5 import BybitAPIError, BybitV5Client
 
 logger = logging.getLogger("smpStrategy.strategy.new_listing")
 
-_STOP_LOSS_WINDOW = timedelta(hours=12)
-_STOP_LOSS_LIMIT = 3
 _EXCLUSION_FILE_NAME = "newListingStrategy.exclusions.json"
 
 
@@ -73,7 +70,6 @@ class NewListingTradingStrategy:
         self._static_exclusions: set[str] = {sym.upper() for sym in self._config.exclude_symbols}
         self._dynamic_exclusions: set[str] = set()
         self._excluded_symbols: set[str] = set(self._static_exclusions)
-        self._stop_loss_events: dict[str, deque[datetime]] = {}
         self._exclusion_file = self._resolve_exclusion_file()
         self._load_persisted_exclusions()
         if self._static_exclusions:
@@ -85,7 +81,6 @@ class NewListingTradingStrategy:
             return
         logger.debug("Starting new listing strategy run: category=%s", self._category)
         positions = self._safe_refresh_positions()
-        self._manage_open_positions(positions)
         wallet_snapshot = self._wallet_manager.fetch_once()
         available = wallet_snapshot.available_balance
         if available <= 0:
@@ -186,70 +181,121 @@ class NewListingTradingStrategy:
             logger.exception("Failed to refresh positions; using last known snapshot: %s", exc)
             return self._position_tracker.positions()
 
-    def _manage_open_positions(self, positions: dict[str, PositionSnapshot]) -> None:
-        if not positions:
-            return
-        for symbol, snapshot in positions.items():
-            leverage = snapshot.leverage if snapshot.leverage > 0 else 1.0
-            tp_threshold = self._config.tp_pct * leverage * 100.0
-            sl_threshold = self._config.sl_pct * leverage * 100.0
-            logger.debug(
-                "Evaluating %s with leverage=%.2f (TP=%.2f%% SL=%.2f%%)",
-                symbol,
-                leverage,
-                tp_threshold,
-                sl_threshold,
-            )
-            pnl_rate = snapshot.pnl_rate
-            if pnl_rate >= tp_threshold:
-                logger.info("Taking profit on %s with pnl_rate=%.2f%%", symbol, pnl_rate)
-                self._close_position(snapshot)
-            elif pnl_rate <= -sl_threshold:
-                logger.info("Stopping loss on %s with pnl_rate=%.2f%%", symbol, pnl_rate)
-                self._handle_stop_loss(snapshot)
+    def _wait_for_fill(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        expected_qty: float,
+        order_id: Optional[str],
+        timeout_s: float = 10.0,
+        poll_interval_s: float = 0.5,
+    ) -> Optional[PositionSnapshot]:
+        if expected_qty <= 0:
+            return None
+        normalized_symbol = symbol.upper()
+        normalized_side = side.lower()
+        deadline = time.monotonic() + max(timeout_s, 1.0)
+        poll_interval = max(poll_interval_s, 0.1)
+        while time.monotonic() < deadline:
+            try:
+                positions = self._position_tracker.refresh()
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "Failed to refresh positions while waiting for fill on %s: %s",
+                    normalized_symbol,
+                    exc,
+                )
+                positions = self._position_tracker.positions()
+            snapshot = positions.get(normalized_symbol)
+            if snapshot and snapshot.side.lower() == normalized_side and abs(snapshot.size) > 0:
+                logger.debug(
+                    "Fill confirmed for %s order_id=%s size=%.8f entry=%.6f",
+                    normalized_symbol,
+                    order_id,
+                    snapshot.size,
+                    snapshot.entry_price,
+                )
+                return snapshot
+            time.sleep(poll_interval)
+        logger.warning(
+            "Timed out waiting for %s order %s to fill; TP/SL not submitted",
+            normalized_symbol,
+            order_id or "<unknown>",
+        )
+        return None
 
-    def _close_position(self, snapshot: PositionSnapshot) -> None:
+    def _apply_trading_stop(
+        self,
+        snapshot: PositionSnapshot,
+        *,
+        instrument: dict[str, float],
+    ) -> None:
+        entry_price = snapshot.entry_price
+        if entry_price <= 0:
+            logger.debug(
+                "Skipping TP/SL for %s because entry price is non-positive",
+                snapshot.symbol,
+            )
+            return
+        tp_pct = max(0.0, self._config.tp_pct)
+        sl_pct = max(0.0, self._config.sl_pct)
+        if tp_pct == 0.0 and sl_pct == 0.0:
+            logger.debug("TP/SL percentages are zero; nothing to configure for %s", snapshot.symbol)
+            return
+        tick_size = instrument.get("tick_size") or 0.0
         side = snapshot.side.lower()
-        if side not in {"buy", "sell"}:
-            logger.warning("Unknown position side for %s: %s", snapshot.symbol, snapshot.side)
+        tp_price: Optional[float]
+        sl_price: Optional[float]
+        if side == "buy":
+            tp_price = entry_price * (1 + tp_pct) if tp_pct > 0 else None
+            sl_price = entry_price * (1 - sl_pct) if sl_pct > 0 else None
+        elif side == "sell":
+            tp_price = entry_price * (1 - tp_pct) if tp_pct > 0 else None
+            sl_price = entry_price * (1 + sl_pct) if sl_pct > 0 else None
+        else:
+            logger.debug("Unknown position side for %s: %s", snapshot.symbol, snapshot.side)
             return
-        opposite = "sell" if side == "buy" else "buy"
-        qty = abs(snapshot.size)
-        if qty <= 0:
-            logger.debug("Zero size encountered for %s; skipping close", snapshot.symbol)
-            return
+        if tp_price is not None:
+            tp_price = self._quantize_price(tp_price, tick_size)
+        if sl_price is not None:
+            sl_price = self._quantize_price(sl_price, tick_size)
         try:
-            self._client.place_order(
+            self._client.set_trading_stop(
                 symbol=snapshot.symbol,
-                side=opposite,
-                qty=qty,
-                orderType="Market",
-                timeInForce="IOC",
-                reduceOnly=True,
+                takeProfit=tp_price,
+                stopLoss=sl_price,
+                tpTriggerBy="LastPrice" if tp_price is not None else None,
+                slTriggerBy="LastPrice" if sl_price is not None else None,
                 category=self._category,
             )
-            logger.info("Submitted reduce-only close for %s size=%s", snapshot.symbol, qty)
+            logger.info(
+                "Configured TP/SL for %s: tp=%s sl=%s",
+                snapshot.symbol,
+                f"{tp_price:.6f}" if tp_price is not None else "<disabled>",
+                f"{sl_price:.6f}" if sl_price is not None else "<disabled>",
+            )
         except BybitAPIError as api_exc:
-            logger.error("Failed to close %s due to API error: %s", snapshot.symbol, api_exc)
+            logger.error(
+                "Bybit API rejected TP/SL for %s: %s",
+                snapshot.symbol,
+                api_exc,
+            )
         except Exception as exc:  # noqa: BLE001
-            logger.exception("Unexpected error while closing %s: %s", snapshot.symbol, exc)
+            logger.exception(
+                "Unexpected error while configuring TP/SL for %s: %s",
+                snapshot.symbol,
+                exc,
+            )
 
-    def _handle_stop_loss(self, snapshot: PositionSnapshot) -> None:
-        symbol = snapshot.symbol.upper()
-        self._record_stop_loss(symbol)
-        self._close_position(snapshot)
-
-    def _record_stop_loss(self, symbol: str) -> None:
-        now = datetime.now(timezone.utc)
-        events = self._stop_loss_events.setdefault(symbol, deque())
-        events.append(now)
-        while events and now - events[0] > _STOP_LOSS_WINDOW:
-            events.popleft()
-        if len(events) >= _STOP_LOSS_LIMIT:
-            hours = int(_STOP_LOSS_WINDOW.total_seconds() // 3600)
-            reason = f"{len(events)} stop losses within the last {hours}h"
-            self._exclude_symbol(symbol, reason)
-            events.clear()
+    @staticmethod
+    def _quantize_price(price: float, tick_size: float) -> float:
+        if tick_size and tick_size > 0:
+            steps = round(price / tick_size)
+            aligned = steps * tick_size
+        else:
+            aligned = price
+        return round(aligned, 10)
 
     def _exclude_symbol(self, symbol: str, reason: str) -> None:
         if symbol in self._excluded_symbols:
@@ -647,6 +693,18 @@ class NewListingTradingStrategy:
                 category=self._category,
             )
             logger.debug("Order response for %s: %s", symbol, response)
+            order_result = response.get("result") if isinstance(response, dict) else None
+            order_id = None
+            if isinstance(order_result, dict):
+                order_id = order_result.get("orderId")
+            snapshot = self._wait_for_fill(
+                symbol=symbol,
+                side=side,
+                expected_qty=qty,
+                order_id=order_id,
+            )
+            if snapshot is not None:
+                self._apply_trading_stop(snapshot, instrument=instrument)
             return notional, margin_required
         except BybitAPIError as api_exc:
             logger.error("Bybit API rejected entry for %s: %s", symbol, api_exc)
