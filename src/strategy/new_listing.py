@@ -39,6 +39,16 @@ class Candle:
     volume: float
 
 
+@dataclass(slots=True)
+class EntryDecision:
+    """Result of an entry attempt including sizing and dynamic TP/SL."""
+
+    notional: float
+    margin_required: float
+    tp_pct: float
+    sl_pct: float
+
+
 class NewListingTradingStrategy:
     """Execute the new-listing momentum strategy once per invocation."""
 
@@ -170,7 +180,8 @@ class NewListingTradingStrategy:
             if entry is None:
                 # None indicates that evaluation aborted without a decision
                 continue
-            notional_used, margin_used = entry
+            notional_used = entry.notional
+            margin_used = entry.margin_required
             if notional_used <= 0 or margin_used <= 0:
                 logger.debug("No order placed for %s", symbol)
                 continue
@@ -249,6 +260,8 @@ class NewListingTradingStrategy:
         snapshot: PositionSnapshot,
         *,
         instrument: dict[str, float],
+        tp_pct: Optional[float] = None,
+        sl_pct: Optional[float] = None,
     ) -> None:
         entry_price = snapshot.entry_price
         if entry_price <= 0:
@@ -257,8 +270,8 @@ class NewListingTradingStrategy:
                 snapshot.symbol,
             )
             return
-        tp_pct = max(0.0, self._config.tp_pct)
-        sl_pct = max(0.0, self._config.sl_pct)
+        tp_pct = self._config.tp_pct if tp_pct is None else max(0.0, tp_pct)
+        sl_pct = self._config.sl_pct if sl_pct is None else max(0.0, sl_pct)
         if tp_pct == 0.0 and sl_pct == 0.0:
             logger.debug("TP/SL percentages are zero; nothing to configure for %s", snapshot.symbol)
             return
@@ -387,7 +400,7 @@ class NewListingTradingStrategy:
         symbol: str,
         available: float,
         margin_cap: float,
-    ) -> Optional[tuple[float, float]]:
+    ) -> Optional[EntryDecision]:
         if available <= 0:
             logger.debug("Skipping %s because available balance is exhausted", symbol)
             return None
@@ -400,12 +413,25 @@ class NewListingTradingStrategy:
         if not timeframe_data:
             logger.debug("Timeframe data incomplete for %s", symbol)
             return None
+        candles_5m = timeframe_data.get("5m", [])
+        atr_ratio = self._compute_atr_ratio(candles_5m, self._config.atr_period)
+        if atr_ratio is None:
+            logger.debug("ATR unavailable for %s; insufficient candles", symbol)
+            return None
+        if self._config.atr_skip_pct > 0 and atr_ratio > self._config.atr_skip_pct:
+            logger.info(
+                "Skipping %s due to high volatility (ATR=%.2f%% threshold=%.2f%%)",
+                symbol,
+                atr_ratio * 100.0,
+                self._config.atr_skip_pct * 100.0,
+            )
+            return None
         trend = self._determine_trend(symbol, timeframe_data)
         if trend is None:
-            logger.info("Trend indeterminate for %s; no position taken", symbol)
+            logger.info("Trend indeterminate for %s; skipping entry (EMA score missing)", symbol)
             return None
         logger.debug("Trend for %s resolved to %s", symbol, trend)
-        entry = self._attempt_entry(symbol, trend, available, margin_cap, timeframe_data)
+        entry = self._attempt_entry(symbol, trend, available, margin_cap, timeframe_data, atr_ratio)
         if entry is None:
             logger.debug("Entry attempt for %s returned no trade", symbol)
         return entry
@@ -415,42 +441,38 @@ class NewListingTradingStrategy:
         symbol: str,
     ) -> Optional[dict[str, list[Candle]]]:
         requirements = self._config.requirements
-        max_required_60 = max(req.min_60m for req in requirements)
-        base_limit_60 = max(max_required_60, self._config.ema_period + 2)
-        candles_60 = self._fetch_candles(symbol, "60", base_limit_60)
-        if not candles_60:
-            logger.debug("No 60m candles retrieved for %s", symbol)
+        max_required_30 = max(req.min_30m for req in requirements)
+        base_limit_30 = max(max_required_30, self._config.ema_period + 2)
+        candles_30 = self._fetch_candles(symbol, "30", base_limit_30)
+        if not candles_30:
+            logger.debug("No 30m candles retrieved for %s", symbol)
             return None
-        available_60 = len(candles_60)
-        requirement = self._select_requirement(available_60, requirements)
+        available_30 = len(candles_30)
+        requirement = self._select_requirement(available_30, requirements)
         if requirement is None:
             logger.debug(
-                "No matching requirement block for %s (available_60=%s)",
+                "No matching requirement block for %s (available_30=%s)",
                 symbol,
-                available_60,
+                available_30,
             )
             return None
         logger.debug(
-            "Requirement '%s' selected for %s (available_60=%s)",
+            "Requirement '%s' selected for %s (available_30=%s)",
             requirement.name,
             symbol,
-            available_60,
+            available_30,
         )
-        candles_60 = candles_60[-max(requirement.min_60m, self._config.ema_period + 1) :]
-        candles_30 = self._fetch_candles(
-            symbol,
-            "30",
-            max(requirement.min_30m, self._config.ema_period + 1),
-        )
+        candles_30 = candles_30[-max(requirement.min_30m, self._config.ema_period + 1) :]
         candles_15 = self._fetch_candles(
             symbol,
             "15",
             max(requirement.min_15m, self._config.ema_period + 1),
         )
+        min_5m_required = max(requirement.min_5m, self._config.min_5m_bars)
         candles_5 = self._fetch_candles(
             symbol,
             "5",
-            max(self._config.min_5m_bars, self._config.ema_period + 1),
+            max(min_5m_required, self._config.ema_period + 1),
         )
         if len(candles_30) < requirement.min_30m or len(candles_15) < requirement.min_15m:
             logger.debug(
@@ -460,38 +482,56 @@ class NewListingTradingStrategy:
                 len(candles_30),
             )
             return {}
-        if len(candles_60) < requirement.min_60m:
-            logger.debug(
-                "Insufficient 60m data for %s (required=%s got=%s)",
-                symbol,
-                requirement.min_60m,
-                len(candles_60),
-            )
-            return {}
-        if len(candles_5) < self._config.min_5m_bars:
+        if len(candles_5) < min_5m_required:
             logger.debug(
                 "Insufficient 5m data for %s (required=%s got=%s)",
                 symbol,
-                self._config.min_5m_bars,
+                min_5m_required,
                 len(candles_5),
             )
             return {}
         return {
+            "5m": candles_5,
             "15m": candles_15,
             "30m": candles_30,
-            "60m": candles_60,
-            "5m": candles_5,
         }
+
+    def _compute_atr_ratio(
+        self,
+        candles: list[Candle],
+        period: int,
+    ) -> Optional[float]:
+        if period <= 0:
+            return None
+        if len(candles) < period + 1:
+            return None
+        trs: list[float] = []
+        start_idx = len(candles) - period
+        for idx in range(start_idx, len(candles)):
+            current = candles[idx]
+            prev = candles[idx - 1]
+            high_low = current.high - current.low
+            high_close = abs(current.high - prev.close)
+            low_close = abs(current.low - prev.close)
+            tr = max(high_low, high_close, low_close)
+            trs.append(tr)
+        if not trs:
+            return None
+        atr = sum(trs) / len(trs)
+        price = candles[-1].close
+        if price <= 0:
+            return None
+        return atr / price
 
     def _select_requirement(
         self,
-        available_60: int,
+        available_30: int,
         requirements: Iterable[TimeframeRequirement],
     ) -> Optional[TimeframeRequirement]:
         for req in requirements:
-            if available_60 < req.min_available_60m:
+            if available_30 < req.min_available_30m:
                 continue
-            if req.max_available_60m is not None and available_60 > req.max_available_60m:
+            if req.max_available_30m is not None and available_30 > req.max_available_30m:
                 continue
             return req
         return None
@@ -563,7 +603,7 @@ class NewListingTradingStrategy:
         if period < 2:
             raise ValueError("EMA period must be >= 2")
         scores: dict[str, float] = {}
-        for tf in ("15m", "30m", "60m"):
+        for tf in ("5m", "15m", "30m"):
             candles = timeframe_data.get(tf)
             if not candles or len(candles) < period + 1:
                 raise ValueError(f"Not enough candles for {tf}")
@@ -620,7 +660,8 @@ class NewListingTradingStrategy:
         available: float,
         margin_cap: float,
         timeframe_data: dict[str, list[Candle]],
-    ) -> Optional[tuple[float, float]]:
+        atr_ratio: float,
+    ) -> Optional[EntryDecision]:
         direction = trend.lower()
         if direction not in {"long", "short"}:
             logger.debug("Unknown trend signal for %s: %s", symbol, trend)
@@ -723,6 +764,18 @@ class NewListingTradingStrategy:
                 budget_margin,
                 margin_required,
             )
+        base_sl_pct = self._config.sl_pct
+        dynamic_sl_pct = max(base_sl_pct, atr_ratio * self._config.atr_sl_multiplier)
+        sl_cap = self._config.atr_sl_cap
+        if sl_cap is not None and sl_cap > 0:
+            dynamic_sl_pct = min(dynamic_sl_pct, sl_cap)
+        if dynamic_sl_pct <= 0:
+            dynamic_sl_pct = base_sl_pct if base_sl_pct > 0 else atr_ratio
+        base_tp_pct = self._config.tp_pct
+        rr_ratio = base_tp_pct / base_sl_pct if base_sl_pct > 0 else 1.5
+        dynamic_tp_pct = max(base_tp_pct, dynamic_sl_pct * rr_ratio)
+        if self._config.atr_tp_bonus > 0:
+            dynamic_tp_pct += atr_ratio * self._config.atr_tp_bonus
         logger.debug(
             "%s final sizing: qty=%.8f notional=%.6f margin_required=%.6f",
             symbol,
@@ -755,8 +808,18 @@ class NewListingTradingStrategy:
                 order_id=order_id,
             )
             if snapshot is not None:
-                self._apply_trading_stop(snapshot, instrument=instrument)
-            return notional, margin_required
+                self._apply_trading_stop(
+                    snapshot,
+                    instrument=instrument,
+                    tp_pct=dynamic_tp_pct,
+                    sl_pct=dynamic_sl_pct,
+                )
+            return EntryDecision(
+                notional=notional,
+                margin_required=margin_required,
+                tp_pct=dynamic_tp_pct,
+                sl_pct=dynamic_sl_pct,
+            )
         except BybitAPIError as api_exc:
             logger.error("Bybit API rejected entry for %s: %s", symbol, api_exc)
         except Exception as exc:  # noqa: BLE001

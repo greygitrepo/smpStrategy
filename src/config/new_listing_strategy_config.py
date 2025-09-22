@@ -18,12 +18,11 @@ class TimeframeRequirement:
     """Thresholds for minimum kline counts per timeframe."""
 
     name: str
-    min_available_60m: int
-    max_available_60m: Optional[int]
+    min_available_30m: int
+    max_available_30m: Optional[int]
     min_5m: int
     min_15m: int
     min_30m: int
-    min_60m: int
 
 
 @dataclass(slots=True)
@@ -33,9 +32,9 @@ class NewListingStrategyConfig:
     enabled: bool = True
     ema_period: int = 9
     leverage: float = 3.0
-    weight_15m: float = 3.0
-    weight_30m: float = 2.0
-    weight_60m: float = 1.0
+    weight_5m: float = 3.0
+    weight_15m: float = 2.0
+    weight_30m: float = 1.0
     fallback_threshold_pct: float = 3.0
     allocation_pct: float = 0.05
     tp_pct: float = 0.014
@@ -44,43 +43,45 @@ class NewListingStrategyConfig:
     max_new_positions: int = 3
     requirements: tuple[TimeframeRequirement, ...] = ()
     exclude_symbols: tuple[str, ...] = ()
+    atr_period: int = 14
+    atr_skip_pct: float = 0.04
+    atr_sl_multiplier: float = 1.2
+    atr_sl_cap: Optional[float] = None
+    atr_tp_bonus: float = 0.0
 
     @property
     def weights(self) -> dict[str, float]:
         return {
+            "5m": self.weight_5m,
             "15m": self.weight_15m,
             "30m": self.weight_30m,
-            "60m": self.weight_60m,
         }
 
 
 _DEFAULT_REQUIREMENTS: tuple[TimeframeRequirement, ...] = (
     TimeframeRequirement(
         name="high",
-        min_available_60m=10,
-        max_available_60m=None,
+        min_available_30m=10,
+        max_available_30m=None,
         min_5m=20,
         min_15m=40,
         min_30m=20,
-        min_60m=10,
     ),
     TimeframeRequirement(
         name="medium",
-        min_available_60m=5,
-        max_available_60m=9,
+        min_available_30m=5,
+        max_available_30m=9,
         min_5m=15,
         min_15m=20,
         min_30m=10,
-        min_60m=5,
     ),
     TimeframeRequirement(
         name="low",
-        min_available_60m=1,
-        max_available_60m=2,
+        min_available_30m=1,
+        max_available_30m=2,
         min_5m=10,
         min_15m=4,
         min_30m=2,
-        min_60m=1,
     ),
 )
 
@@ -99,19 +100,18 @@ def _parse_symbol_list(raw: str) -> tuple[str, ...]:
 
 
 def _parse_requirement(section_name: str, section: configparser.SectionProxy) -> TimeframeRequirement:
-    min_available = max(0, section.getint("min_available_60m", fallback=0))
-    max_available_raw = section.get("max_available_60m", fallback="").strip()
+    min_available = max(0, section.getint("min_available_30m", fallback=0))
+    max_available_raw = section.get("max_available_30m", fallback="").strip()
     max_available = int(max_available_raw) if max_available_raw else None
     if max_available is not None and max_available <= 0:
         max_available = None
     return TimeframeRequirement(
         name=section.get("name", fallback=section_name.split(".")[-1]),
-        min_available_60m=min_available,
-        max_available_60m=max_available,
+        min_available_30m=min_available,
+        max_available_30m=max_available,
         min_5m=max(1, section.getint("min_5m", fallback=10)),
         min_15m=max(1, section.getint("min_15m", fallback=10)),
-        min_30m=max(1, section.getint("min_30m", fallback=5)),
-        min_60m=max(1, section.getint("min_60m", fallback=min_available or 1)),
+        min_30m=max(1, section.getint("min_30m", fallback=min_available or 1)),
     )
 
 
@@ -168,6 +168,34 @@ def load_new_listing_strategy_config(
             assume_percent=True,
         ),
     )
+    atr_period = max(1, base.getint("atr_period", fallback=12))
+    atr_skip_pct = max(
+        0.0,
+        _normalize_percent(
+            base.getfloat("atr_skip_pct", fallback=7.5),
+            assume_percent=True,
+        ),
+    )
+    atr_sl_multiplier = max(0.0, base.getfloat("atr_sl_multiplier", fallback=1.0))
+    atr_sl_cap_raw = base.get("atr_sl_cap", fallback="").strip()
+    atr_sl_cap: Optional[float]
+    if atr_sl_cap_raw:
+        try:
+            atr_sl_cap = max(
+                0.0,
+                _normalize_percent(float(atr_sl_cap_raw), assume_percent=True),
+            )
+        except ValueError:
+            atr_sl_cap = None
+    else:
+        atr_sl_cap = None
+    atr_tp_bonus = max(
+        0.0,
+        _normalize_percent(
+            base.getfloat("atr_tp_bonus", fallback=0.5),
+            assume_percent=True,
+        ),
+    )
     tp_pct = max(
         0.0,
         _normalize_percent(
@@ -195,7 +223,7 @@ def load_new_listing_strategy_config(
     requirements = tuple(
         sorted(
             requirement_sections or _DEFAULT_REQUIREMENTS,
-            key=lambda item: item.min_available_60m,
+            key=lambda item: item.min_available_30m,
             reverse=True,
         )
     )
@@ -203,9 +231,9 @@ def load_new_listing_strategy_config(
     config = NewListingStrategyConfig(
         enabled=enabled,
         ema_period=ema_period,
-        weight_15m=base.getfloat("weight_15m", fallback=3.0),
-        weight_30m=base.getfloat("weight_30m", fallback=2.0),
-        weight_60m=base.getfloat("weight_60m", fallback=1.0),
+        weight_5m=base.getfloat("weight_5m", fallback=3.0),
+        weight_15m=base.getfloat("weight_15m", fallback=2.0),
+        weight_30m=base.getfloat("weight_30m", fallback=1.0),
         fallback_threshold_pct=fallback_threshold_pct,
         leverage=leverage,
         allocation_pct=allocation_pct,
@@ -215,6 +243,11 @@ def load_new_listing_strategy_config(
         max_new_positions=max_new_positions,
         requirements=requirements,
         exclude_symbols=exclude_symbols,
+        atr_period=atr_period,
+        atr_skip_pct=atr_skip_pct,
+        atr_sl_multiplier=atr_sl_multiplier,
+        atr_sl_cap=atr_sl_cap,
+        atr_tp_bonus=atr_tp_bonus,
     )
     return config
 
@@ -240,15 +273,19 @@ def default_new_listing_strategy_config() -> NewListingStrategyConfig:
         requirements=tuple(
             TimeframeRequirement(
                 name=req.name,
-                min_available_60m=req.min_available_60m,
-                max_available_60m=req.max_available_60m,
+                min_available_30m=req.min_available_30m,
+                max_available_30m=req.max_available_30m,
                 min_5m=req.min_5m,
                 min_15m=req.min_15m,
                 min_30m=req.min_30m,
-                min_60m=req.min_60m,
             )
             for req in _DEFAULT_REQUIREMENTS
         ),
         max_new_positions=3,
         exclude_symbols=(),
+        atr_period=12,
+        atr_skip_pct=0.075,
+        atr_sl_multiplier=1.0,
+        atr_sl_cap=0.036,
+        atr_tp_bonus=0.005,
     )
