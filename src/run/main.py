@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 # allow running as a script (e.g. F5 in IDE) without manual PYTHONPATH tweaks
@@ -37,20 +37,38 @@ from src.strategy import NewListingTradingStrategy  # noqa: E402  pylint: disabl
 logger = logging.getLogger("smpStrategy")
 
 
-def _setup_logging() -> Path:
+def _configure_logging(log_file: Path) -> None:
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s - %(message)s")
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    for handler in root.handlers[:]:
+        handler.close()
+        root.removeHandler(handler)
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setFormatter(formatter)
+    file_handler = logging.FileHandler(log_file, encoding="utf-8")
+    file_handler.setFormatter(formatter)
+    root.addHandler(stream_handler)
+    root.addHandler(file_handler)
+
+
+def _setup_logging() -> tuple[Path, datetime]:
     log_dir = Path(__file__).resolve().parents[2] / "log"
     log_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_file = log_dir / f"smpStrategy_{timestamp}.log"
-    logging.basicConfig(
-        level=logging.DEBUG,
-        format="%(asctime)s %(levelname)s %(name)s - %(message)s",
-        handlers=[
-            logging.StreamHandler(sys.stdout),
-            logging.FileHandler(log_file, encoding="utf-8"),
-        ],
-    )
-    return log_file
+    _configure_logging(log_file)
+    return log_file, datetime.now()
+
+
+def _maybe_rotate_logs(
+    current_file: Path,
+    start_time: datetime,
+    rotation_hours: int = 6,
+) -> tuple[Path, datetime]:
+    if datetime.now() - start_time < timedelta(hours=rotation_hours):
+        return current_file, start_time
+    return _setup_logging()
 
 
 def _require_account_config() -> BybitV5Client:
@@ -77,7 +95,7 @@ def _require_account_config() -> BybitV5Client:
 
 
 def main() -> None:
-    log_file = _setup_logging()
+    log_file, log_started = _setup_logging()
     logger.info("Logging to %s", log_file)
     client = _require_account_config()
     logger.info("Bybit REST client ready: base_url=%s", client.base_url)
@@ -175,6 +193,10 @@ def main() -> None:
             except Exception as exc:  # noqa: BLE001
                 logger.exception("New listing trading strategy failed: %s", exc)
             first_symbols = None
+            new_log_file, new_start = _maybe_rotate_logs(log_file, log_started)
+            if new_log_file != log_file:
+                logger.info("Rotated log file to %s", new_log_file)
+            log_file, log_started = new_log_file, new_start
             time.sleep(5.0)
     except KeyboardInterrupt:
         logger.info("Received interrupt, stopping trading loop")
