@@ -19,6 +19,7 @@ from .new_listing_strategy_config import (
     load_new_listing_strategy_config,
     maybe_load_new_listing_strategy_config,
     resolve_new_listing_strategy_config_path,
+    write_new_listing_strategy_config,
 )
 from .wallet_config import (
     WalletConfig,
@@ -43,6 +44,7 @@ __all__ = [
     "load_new_listing_strategy_config",
     "maybe_load_new_listing_strategy_config",
     "resolve_new_listing_strategy_config_path",
+    "write_new_listing_strategy_config",
     "load_wallet_config",
     "maybe_load_wallet_config",
     "resolve_wallet_config_path",

@@ -481,6 +481,28 @@ class BybitV5Client:
         }
         return self._request("GET", "/v5/execution/list", params=params, auth=True)
 
+    def get_closed_pnl(
+        self,
+        *,
+        category: Optional[str] = None,
+        symbol: Optional[str] = None,
+        settleCoin: Optional[str] = None,
+        start: Optional[int] = None,
+        end: Optional[int] = None,
+        limit: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Fetch closed PnL records for derivatives positions."""
+
+        params: Dict[str, Any] = {
+            "category": category or self.default_category,
+            "symbol": symbol,
+            "settleCoin": settleCoin,
+            "start": start,
+            "end": end,
+            "limit": limit,
+        }
+        return self._request("GET", "/v5/position/closed-pnl", params=params, auth=True)
+
     # -------- Private trading/account endpoints --------
     def place_order(
         self,

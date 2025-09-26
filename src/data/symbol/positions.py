@@ -39,6 +39,14 @@ class ActivePositionTracker:
         with self._lock:
             return dict(self._positions)
 
+    @property
+    def category(self) -> str:
+        return self._category
+
+    @property
+    def settle_coin(self) -> str:
+        return self._settle_coin
+
     def refresh(self) -> Dict[str, PositionSnapshot]:
         response = self._client.get_positions(
             category=self._category,

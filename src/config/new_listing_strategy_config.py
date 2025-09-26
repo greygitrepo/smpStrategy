@@ -48,6 +48,8 @@ class NewListingStrategyConfig:
     atr_sl_multiplier: float = 1.2
     atr_sl_cap: Optional[float] = None
     atr_tp_bonus: float = 0.0
+    tuning_min_total_trades: int = 30
+    tuning_min_gap_trades: int = 15
 
     @property
     def weights(self) -> dict[str, float]:
@@ -212,6 +214,8 @@ def load_new_listing_strategy_config(
     )
     min_5m_bars = max(1, base.getint("min_5m_bars", fallback=20))
     max_new_positions = max(1, base.getint("max_new_positions", fallback=3))
+    tuning_min_total_trades = max(1, base.getint("tuning_min_total_trades", fallback=30))
+    tuning_min_gap_trades = max(1, base.getint("tuning_min_gap_trades", fallback=15))
     requirement_sections: list[TimeframeRequirement] = []
     prefix = f"{base_section_name}."
     for section_name in parser.sections():
@@ -248,6 +252,8 @@ def load_new_listing_strategy_config(
         atr_sl_multiplier=atr_sl_multiplier,
         atr_sl_cap=atr_sl_cap,
         atr_tp_bonus=atr_tp_bonus,
+        tuning_min_total_trades=tuning_min_total_trades,
+        tuning_min_gap_trades=tuning_min_gap_trades,
     )
     return config
 
@@ -263,6 +269,81 @@ def maybe_load_new_listing_strategy_config(
         if strict:
             raise
         return None
+
+
+def _format_float(value: float) -> str:
+    formatted = f"{value:.6f}"
+    while formatted.endswith("0") and "." in formatted:
+        formatted = formatted[:-1]
+    if formatted.endswith("."):
+        formatted = formatted[:-1]
+    return formatted or "0"
+
+
+def _format_percent(value: float) -> str:
+    return _format_float(value * 100.0)
+
+
+def _sanitize_requirement_name(name: str, index: int) -> str:
+    slug = "".join(ch.lower() if ch.isalnum() else "_" for ch in name.strip())
+    slug = "_".join(filter(None, slug.split("_")))
+    if not slug:
+        slug = f"req_{index + 1}"
+    return slug
+
+
+def write_new_listing_strategy_config(
+    config: NewListingStrategyConfig,
+    path: str | os.PathLike[str],
+) -> Path:
+    parser = configparser.ConfigParser()
+    section_name = "new_listing_strategy"
+    base_section = {
+        "enabled": "true" if config.enabled else "false",
+        "ema_period": str(config.ema_period),
+        "leverage": _format_float(config.leverage),
+        "weight_5m": _format_float(config.weight_5m),
+        "weight_15m": _format_float(config.weight_15m),
+        "weight_30m": _format_float(config.weight_30m),
+        "fallback_threshold_pct": _format_percent(config.fallback_threshold_pct),
+        "allocation_pct": _format_percent(config.allocation_pct),
+        "tp_pct": _format_percent(config.tp_pct),
+        "sl_pct": _format_percent(config.sl_pct),
+        "min_5m_bars": str(config.min_5m_bars),
+        "max_new_positions": str(config.max_new_positions),
+        "atr_period": str(config.atr_period),
+        "atr_skip_pct": _format_percent(config.atr_skip_pct),
+        "atr_sl_multiplier": _format_float(config.atr_sl_multiplier),
+        "atr_tp_bonus": _format_percent(config.atr_tp_bonus),
+        "tuning_min_total_trades": str(config.tuning_min_total_trades),
+        "tuning_min_gap_trades": str(config.tuning_min_gap_trades),
+        "exclude_symbols": ", ".join(config.exclude_symbols),
+    }
+    if config.atr_sl_cap is not None:
+        base_section["atr_sl_cap"] = _format_percent(config.atr_sl_cap)
+    else:
+        base_section["atr_sl_cap"] = ""
+    if config.exclude_symbols:
+        base_section["exclude_symbols"] = ", ".join(config.exclude_symbols)
+    parser[section_name] = base_section
+
+    for idx, requirement in enumerate(config.requirements):
+        slug = _sanitize_requirement_name(requirement.name, idx)
+        req_section_name = f"{section_name}.requirement_{slug}"
+        parser[req_section_name] = {
+            "name": requirement.name,
+            "min_available_30m": str(requirement.min_available_30m),
+            "max_available_30m": "" if requirement.max_available_30m is None else str(requirement.max_available_30m),
+            "min_5m": str(requirement.min_5m),
+            "min_15m": str(requirement.min_15m),
+            "min_30m": str(requirement.min_30m),
+        }
+
+    output_path = Path(path).expanduser()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8") as handle:
+        parser.write(handle)
+    return output_path
 
 
 def default_new_listing_strategy_config() -> NewListingStrategyConfig:
@@ -288,4 +369,6 @@ def default_new_listing_strategy_config() -> NewListingStrategyConfig:
         atr_sl_multiplier=1.0,
         atr_sl_cap=0.036,
         atr_tp_bonus=0.005,
+        tuning_min_total_trades=30,
+        tuning_min_gap_trades=15,
     )

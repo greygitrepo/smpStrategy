@@ -7,20 +7,27 @@ import logging
 import math
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Any, Iterable, Optional
 
 from src.config.new_listing_strategy_config import (
     NewListingStrategyConfig,
     TimeframeRequirement,
     default_new_listing_strategy_config,
     maybe_load_new_listing_strategy_config,
+    write_new_listing_strategy_config,
 )
 from src.data.symbol.positions import ActivePositionTracker
 from src.data.symbol.snapshots import PositionSnapshot
 from src.data.symbol.discovery import SymbolDiscoveryStrategy
 from src.data.wallet_manager import WalletDataManager
 from src.exchange.bybit_v5 import BybitAPIError, BybitV5Client
+from src.strategy.analytics import (
+    AdaptiveParameterManager,
+    PerformanceTracker,
+    TradeLedger,
+)
 
 logger = logging.getLogger("smpStrategy.strategy.new_listing")
 
@@ -47,6 +54,17 @@ class EntryDecision:
     margin_required: float
     tp_pct: float
     sl_pct: float
+    qty: float
+    side: str
+    order_id: Optional[str] = None
+
+
+@dataclass(slots=True)
+class TimeframeDataResult:
+    """Container for collected timeframe data and chosen requirement block."""
+
+    requirement: TimeframeRequirement
+    frames: dict[str, list[Candle]]
 
 
 class NewListingTradingStrategy:
@@ -84,6 +102,34 @@ class NewListingTradingStrategy:
         self._load_persisted_exclusions()
         if self._static_exclusions:
             logger.info("Static exclusions configured: %s", ", ".join(sorted(self._static_exclusions)))
+        analytics_root = Path(__file__).resolve().parents[2] / "analytics"
+        analytics_root.mkdir(parents=True, exist_ok=True)
+        history_file = analytics_root / "trade_history.jsonl"
+        performance_file = analytics_root / "performance_snapshot.json"
+        tuning_log_file = analytics_root / "parameter_tuning.jsonl"
+        self._optimized_config_path = analytics_root / "newListingStrategy_optimized.ini"
+        settle_coin = getattr(position_tracker, "settle_coin", "USDT")
+        self._trade_ledger = TradeLedger(
+            client=self._client,
+            category=self._category,
+            settle_coin=settle_coin,
+            history_file=history_file,
+        )
+        self._performance_tracker = PerformanceTracker(
+            history_file=history_file,
+            output_file=performance_file,
+        )
+        self._parameter_manager = AdaptiveParameterManager(
+            config=self._config,
+            log_file=tuning_log_file,
+            min_total_trades=self._config.tuning_min_total_trades,
+            min_gap_trades=self._config.tuning_min_gap_trades,
+        )
+        self._trade_ledger.bootstrap(position_tracker.positions())
+        try:
+            write_new_listing_strategy_config(self._config, self._optimized_config_path)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Initial optimized config snapshot failed: %s", exc)
 
     def run_once(self, *, initial_candidates: Optional[Iterable[str]] = None) -> None:
         if not self._config.enabled:
@@ -91,6 +137,7 @@ class NewListingTradingStrategy:
             return
         logger.debug("Starting new listing strategy run: category=%s", self._category)
         positions = self._safe_refresh_positions()
+        self._update_analytics_after_refresh(positions)
         wallet_snapshot = self._wallet_manager.fetch_once()
         available = wallet_snapshot.available_balance
         if available <= 0:
@@ -387,6 +434,100 @@ class NewListingTradingStrategy:
         except Exception as exc:  # noqa: BLE001
             logger.exception("Unexpected error while persisting exclusions to %s: %s", path, exc)
 
+    def _log_decision_snapshot(self, payload: dict[str, Any]) -> None:
+        try:
+            message = json.dumps(payload, default=self._json_default, ensure_ascii=True)
+        except TypeError:
+            logger.debug("Failed to serialize decision snapshot payload; emitting fallback repr")
+            message = repr(payload)
+        logger.info("DecisionSnapshot %s", message)
+
+    @staticmethod
+    def _json_default(obj: Any) -> Any:
+        if isinstance(obj, (datetime,)):
+            return obj.isoformat()
+        if isinstance(obj, set):
+            return sorted(obj)
+        if hasattr(obj, "__dict__"):
+            return obj.__dict__
+        raise TypeError(f"Object of type {type(obj)!r} is not JSON serializable")
+
+    def _register_entry(
+        self,
+        snapshot: PositionSnapshot,
+        *,
+        order_id: Optional[str],
+        qty: float,
+        notional: float,
+        margin_required: float,
+        decision_context: dict[str, Any],
+        tp_pct: float,
+        sl_pct: float,
+    ) -> None:
+        if not hasattr(self, "_trade_ledger"):
+            return
+        context = dict(decision_context)
+        context.update(
+            {
+                "tp_pct": tp_pct,
+                "sl_pct": sl_pct,
+                "notional": notional,
+                "margin_required": margin_required,
+                "order_id": order_id,
+            }
+        )
+        self._trade_ledger.register_entry(
+            snapshot,
+            order_id=order_id,
+            qty=qty,
+            notional=notional,
+            margin_required=margin_required,
+            context=context,
+        )
+
+    def _update_analytics_after_refresh(
+        self,
+        positions: dict[str, PositionSnapshot],
+    ) -> None:
+        if not hasattr(self, "_trade_ledger"):
+            return
+        try:
+            closed_records = self._trade_ledger.sync(positions)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Trade ledger sync failed: %s", exc)
+            return
+        if not closed_records:
+            return
+        try:
+            snapshot = self._performance_tracker.record(closed_records)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Performance tracker update failed: %s", exc)
+            return
+        if not snapshot:
+            return
+        try:
+            changes = self._parameter_manager.maybe_update(snapshot)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Parameter manager update failed: %s", exc)
+            return
+        if not changes:
+            return
+        try:
+            write_new_listing_strategy_config(self._config, self._optimized_config_path)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Failed to persist optimized config snapshot: %s", exc)
+        payload = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "changes": changes,
+            "metrics": snapshot.get("window", {}),
+            "optimized_config_path": str(self._optimized_config_path),
+        }
+        try:
+            message = json.dumps(payload, default=self._json_default, ensure_ascii=True)
+        except TypeError:
+            message = repr(payload)
+        logger.info("ParameterUpdate %s", message)
+
     # ----- Symbol evaluation -----
     def _fetch_candidate_symbols(self) -> list[str]:
         try:
@@ -401,23 +542,46 @@ class NewListingTradingStrategy:
         available: float,
         margin_cap: float,
     ) -> Optional[EntryDecision]:
+        decision_details: dict[str, Any] = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "symbol": symbol,
+            "available_margin": round(available, 8),
+            "margin_cap": round(margin_cap, 8),
+        }
+
+        def _skip(reason: str, extra: Optional[dict[str, Any]] = None) -> Optional[EntryDecision]:
+            payload = dict(decision_details)
+            payload["status"] = "skipped"
+            payload["reason"] = reason
+            if extra:
+                payload.update(extra)
+            self._log_decision_snapshot(payload)
+            return None
+
         if available <= 0:
             logger.debug("Skipping %s because available balance is exhausted", symbol)
-            return None
+            return _skip("available_balance_exhausted")
         if margin_cap <= 0:
             logger.debug("Skipping %s because margin cap is non-positive", symbol)
-            return None
-        timeframe_data = self._collect_timeframe_data(symbol)
-        if timeframe_data is None:
-            return None
-        if not timeframe_data:
-            logger.debug("Timeframe data incomplete for %s", symbol)
-            return None
-        candles_5m = timeframe_data.get("5m", [])
+            return _skip("margin_cap_non_positive")
+        timeframe_result = self._collect_timeframe_data(symbol)
+        if timeframe_result is None:
+            return _skip("timeframe_data_unavailable")
+        decision_details["requirement"] = timeframe_result.requirement.name
+        frames = timeframe_result.frames
+        if not frames:
+            return _skip("timeframe_data_incomplete")
+        decision_details["candles"] = {tf: len(frames.get(tf, [])) for tf in ("5m", "15m", "30m")}
+        candles_5m = frames.get("5m", [])
         atr_ratio = self._compute_atr_ratio(candles_5m, self._config.atr_period)
         if atr_ratio is None:
             logger.debug("ATR unavailable for %s; insufficient candles", symbol)
-            return None
+            return _skip("atr_unavailable")
+        decision_details["atr"] = {
+            "ratio": round(atr_ratio, 6),
+            "period": self._config.atr_period,
+            "skip_pct": self._config.atr_skip_pct,
+        }
         if self._config.atr_skip_pct > 0 and atr_ratio > self._config.atr_skip_pct:
             logger.info(
                 "Skipping %s due to high volatility (ATR=%.2f%% threshold=%.2f%%)",
@@ -425,21 +589,52 @@ class NewListingTradingStrategy:
                 atr_ratio * 100.0,
                 self._config.atr_skip_pct * 100.0,
             )
-            return None
-        trend = self._determine_trend(symbol, timeframe_data)
+            return _skip("volatility_exceeds_threshold")
+        trend, trend_meta = self._determine_trend(symbol, frames)
         if trend is None:
             logger.info("Trend indeterminate for %s; skipping entry (EMA score missing)", symbol)
-            return None
+            return _skip("trend_indeterminate", {"trend": trend_meta})
         logger.debug("Trend for %s resolved to %s", symbol, trend)
-        entry = self._attempt_entry(symbol, trend, available, margin_cap, timeframe_data, atr_ratio)
+        trend_info = dict(trend_meta)
+        trend_info["direction"] = trend
+        decision_details["trend"] = trend_info
+        decision_context = {
+            "symbol": symbol,
+            "trend": trend_info,
+            "atr_ratio": atr_ratio,
+            "requirement": timeframe_result.requirement.name,
+            "candles": decision_details.get("candles", {}),
+        }
+        entry = self._attempt_entry(
+            symbol,
+            trend,
+            available,
+            margin_cap,
+            frames,
+            atr_ratio,
+            decision_context,
+        )
         if entry is None:
             logger.debug("Entry attempt for %s returned no trade", symbol)
+            return _skip("entry_not_placed", {"trend": trend_info})
+        payload = dict(decision_details)
+        payload["status"] = "entered"
+        payload["entry"] = {
+            "notional": round(entry.notional, 6),
+            "margin_required": round(entry.margin_required, 6),
+            "tp_pct": round(entry.tp_pct, 6),
+            "sl_pct": round(entry.sl_pct, 6),
+            "qty": round(entry.qty, 8),
+            "side": entry.side,
+            "order_id": entry.order_id,
+        }
+        self._log_decision_snapshot(payload)
         return entry
 
     def _collect_timeframe_data(
         self,
         symbol: str,
-    ) -> Optional[dict[str, list[Candle]]]:
+    ) -> Optional[TimeframeDataResult]:
         requirements = self._config.requirements
         max_required_30 = max(req.min_30m for req in requirements)
         base_limit_30 = max(max_required_30, self._config.ema_period + 2)
@@ -481,7 +676,7 @@ class NewListingTradingStrategy:
                 len(candles_15),
                 len(candles_30),
             )
-            return {}
+            return TimeframeDataResult(requirement=requirement, frames={})
         if len(candles_5) < min_5m_required:
             logger.debug(
                 "Insufficient 5m data for %s (required=%s got=%s)",
@@ -489,12 +684,13 @@ class NewListingTradingStrategy:
                 min_5m_required,
                 len(candles_5),
             )
-            return {}
-        return {
+            return TimeframeDataResult(requirement=requirement, frames={})
+        frames = {
             "5m": candles_5,
             "15m": candles_15,
             "30m": candles_30,
         }
+        return TimeframeDataResult(requirement=requirement, frames=frames)
 
     def _compute_atr_ratio(
         self,
@@ -581,22 +777,33 @@ class NewListingTradingStrategy:
         self,
         symbol: str,
         timeframe_data: dict[str, list[Candle]],
-    ) -> Optional[str]:
+    ) -> tuple[Optional[str], dict[str, Any]]:
+        meta: dict[str, Any] = {}
+        ema_scores: Optional[dict[str, float]]
         try:
             ema_scores = self._compute_ema_scores(timeframe_data)
         except ValueError as exc:
             logger.debug("EMA score computation failed for %s: %s", symbol, exc)
+            meta["ema_error"] = str(exc)
             ema_scores = None
-        if not ema_scores:
-            logger.debug("EMA analysis skipped for %s; attempting fallback", symbol)
-            return self._fallback_trend(symbol, timeframe_data.get("5m", []))
-        aggregate = sum(ema_scores.values())
-        logger.debug("EMA trend scores for %s: %s (aggregate=%.6f)", symbol, ema_scores, aggregate)
-        if aggregate > 0:
-            return "Long"
-        if aggregate < 0:
-            return "Short"
-        return self._fallback_trend(symbol, timeframe_data.get("5m", []))
+        if ema_scores:
+            aggregate = sum(ema_scores.values())
+            logger.debug("EMA trend scores for %s: %s (aggregate=%.6f)", symbol, ema_scores, aggregate)
+            meta.update(
+                {
+                    "method": "ema",
+                    "ema_scores": {key: round(value, 6) for key, value in ema_scores.items()},
+                    "ema_aggregate": round(aggregate, 6),
+                }
+            )
+            if aggregate > 0:
+                return "Long", meta
+            if aggregate < 0:
+                return "Short", meta
+        logger.debug("EMA analysis inconclusive for %s; attempting fallback", symbol)
+        fallback_trend, fallback_meta = self._fallback_trend(symbol, timeframe_data.get("5m", []))
+        meta.update(fallback_meta)
+        return fallback_trend, meta
 
     def _compute_ema_scores(self, timeframe_data: dict[str, list[Candle]]) -> dict[str, float]:
         period = self._config.ema_period
@@ -631,16 +838,29 @@ class NewListingTradingStrategy:
             ema_values.append(ema)
         return ema_values
 
-    def _fallback_trend(self, symbol: str, candles_5m: list[Candle]) -> Optional[str]:
+    def _fallback_trend(
+        self,
+        symbol: str,
+        candles_5m: list[Candle],
+    ) -> tuple[Optional[str], dict[str, Any]]:
+        meta: dict[str, Any] = {"method": "fallback"}
         if not candles_5m:
             logger.debug("Fallback trend skipped for %s: missing 5m data", symbol)
-            return None
+            meta["reason"] = "missing_5m_data"
+            return None, meta
         last = candles_5m[-1]
         if last.open <= 0:
             logger.debug("Invalid open price in fallback for %s: %s", symbol, last)
-            return None
+            meta["reason"] = "invalid_open"
+            return None, meta
         change_pct = ((last.close - last.open) / last.open) * 100.0
         threshold = self._config.fallback_threshold_pct
+        meta.update(
+            {
+                "change_pct": round(change_pct, 6),
+                "threshold_pct": threshold,
+            }
+        )
         logger.debug(
             "Fallback change for %s: %.4f%% (threshold=%.2f%%)",
             symbol,
@@ -648,10 +868,15 @@ class NewListingTradingStrategy:
             threshold,
         )
         if change_pct >= threshold:
-            return "Long"
+            meta["fallback_triggered"] = True
+            meta["direction"] = "Long"
+            return "Long", meta
         if change_pct <= -threshold:
-            return "Short"
-        return None
+            meta["fallback_triggered"] = True
+            meta["direction"] = "Short"
+            return "Short", meta
+        meta["fallback_triggered"] = False
+        return None, meta
 
     def _attempt_entry(
         self,
@@ -661,6 +886,7 @@ class NewListingTradingStrategy:
         margin_cap: float,
         timeframe_data: dict[str, list[Candle]],
         atr_ratio: float,
+        decision_context: dict[str, Any],
     ) -> Optional[EntryDecision]:
         direction = trend.lower()
         if direction not in {"long", "short"}:
@@ -808,6 +1034,23 @@ class NewListingTradingStrategy:
                 order_id=order_id,
             )
             if snapshot is not None:
+                try:
+                    self._register_entry(
+                        snapshot,
+                        order_id=order_id,
+                        qty=qty,
+                        notional=notional,
+                        margin_required=margin_required,
+                        decision_context=decision_context,
+                        tp_pct=dynamic_tp_pct,
+                        sl_pct=dynamic_sl_pct,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug(
+                        "Failed to register entry analytics for %s: %s",
+                        symbol,
+                        exc,
+                    )
                 self._apply_trading_stop(
                     snapshot,
                     instrument=instrument,
@@ -819,6 +1062,9 @@ class NewListingTradingStrategy:
                 margin_required=margin_required,
                 tp_pct=dynamic_tp_pct,
                 sl_pct=dynamic_sl_pct,
+                qty=qty,
+                side=side,
+                order_id=order_id,
             )
         except BybitAPIError as api_exc:
             logger.error("Bybit API rejected entry for %s: %s", symbol, api_exc)
