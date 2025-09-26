@@ -10,3 +10,9 @@ src/exchange/__pycache__/
 src/data/symbol/__pycache__/
 
 src/data/wallet_manager/__pycache__/
+
+log/
+
+src/strategy/analytics/__pycache__/
+
+src/strategy/__pycache__/

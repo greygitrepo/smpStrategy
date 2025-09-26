@@ -7,7 +7,7 @@ import logging
 import math
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
@@ -16,7 +16,6 @@ from src.config.new_listing_strategy_config import (
     TimeframeRequirement,
     default_new_listing_strategy_config,
     maybe_load_new_listing_strategy_config,
-    write_new_listing_strategy_config,
 )
 from src.data.symbol.positions import ActivePositionTracker
 from src.data.symbol.snapshots import PositionSnapshot
@@ -107,7 +106,9 @@ class NewListingTradingStrategy:
         history_file = analytics_root / "trade_history.jsonl"
         performance_file = analytics_root / "performance_snapshot.json"
         tuning_log_file = analytics_root / "parameter_tuning.jsonl"
-        self._optimized_config_path = analytics_root / "newListingStrategy_optimized.ini"
+        optimized_config_path = analytics_root / "newListingStrategy_optimized.ini"
+        optimizer_root = analytics_root / "optimizer"
+        optimizer_root.mkdir(parents=True, exist_ok=True)
         settle_coin = getattr(position_tracker, "settle_coin", "USDT")
         self._trade_ledger = TradeLedger(
             client=self._client,
@@ -122,14 +123,14 @@ class NewListingTradingStrategy:
         self._parameter_manager = AdaptiveParameterManager(
             config=self._config,
             log_file=tuning_log_file,
-            min_total_trades=self._config.tuning_min_total_trades,
-            min_gap_trades=self._config.tuning_min_gap_trades,
+            model_dir=optimizer_root,
+            optimized_config_path=optimized_config_path,
+            evaluation_trades=20,
+            evaluation_duration=timedelta(hours=2),
+            candidate_trade_interval=20,
+            candidate_time_interval=timedelta(hours=2),
         )
         self._trade_ledger.bootstrap(position_tracker.positions())
-        try:
-            write_new_listing_strategy_config(self._config, self._optimized_config_path)
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("Initial optimized config snapshot failed: %s", exc)
 
     def run_once(self, *, initial_candidates: Optional[Iterable[str]] = None) -> None:
         if not self._config.enabled:
@@ -474,6 +475,15 @@ class NewListingTradingStrategy:
                 "notional": notional,
                 "margin_required": margin_required,
                 "order_id": order_id,
+                "allocation_pct": decision_context.get("allocation_pct", self._config.allocation_pct),
+                "atr_skip_pct": decision_context.get("atr_skip_pct", self._config.atr_skip_pct),
+                "ema_period": decision_context.get("ema_period", self._config.ema_period),
+                "weight_5m": decision_context.get("weight_5m", self._config.weight_5m),
+                "weight_15m": decision_context.get("weight_15m", self._config.weight_15m),
+                "weight_30m": decision_context.get("weight_30m", self._config.weight_30m),
+                "fallback_threshold_pct": decision_context.get(
+                    "fallback_threshold_pct", self._config.fallback_threshold_pct
+                ),
             }
         )
         self._trade_ledger.register_entry(
@@ -495,38 +505,17 @@ class NewListingTradingStrategy:
             closed_records = self._trade_ledger.sync(positions)
         except Exception as exc:  # noqa: BLE001
             logger.debug("Trade ledger sync failed: %s", exc)
-            return
-        if not closed_records:
-            return
+            closed_records = []
+        snapshot = None
+        if closed_records:
+            try:
+                snapshot = self._performance_tracker.record(closed_records)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Performance tracker update failed: %s", exc)
         try:
-            snapshot = self._performance_tracker.record(closed_records)
+            self._parameter_manager.process_trades(closed_records, snapshot)
         except Exception as exc:  # noqa: BLE001
-            logger.debug("Performance tracker update failed: %s", exc)
-            return
-        if not snapshot:
-            return
-        try:
-            changes = self._parameter_manager.maybe_update(snapshot)
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("Parameter manager update failed: %s", exc)
-            return
-        if not changes:
-            return
-        try:
-            write_new_listing_strategy_config(self._config, self._optimized_config_path)
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("Failed to persist optimized config snapshot: %s", exc)
-        payload = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "changes": changes,
-            "metrics": snapshot.get("window", {}),
-            "optimized_config_path": str(self._optimized_config_path),
-        }
-        try:
-            message = json.dumps(payload, default=self._json_default, ensure_ascii=True)
-        except TypeError:
-            message = repr(payload)
-        logger.info("ParameterUpdate %s", message)
+            logger.debug("Parameter manager processing failed: %s", exc)
 
     # ----- Symbol evaluation -----
     def _fetch_candidate_symbols(self) -> list[str]:
@@ -604,6 +593,13 @@ class NewListingTradingStrategy:
             "atr_ratio": atr_ratio,
             "requirement": timeframe_result.requirement.name,
             "candles": decision_details.get("candles", {}),
+            "allocation_pct": self._config.allocation_pct,
+            "atr_skip_pct": self._config.atr_skip_pct,
+            "ema_period": self._config.ema_period,
+            "weight_5m": self._config.weight_5m,
+            "weight_15m": self._config.weight_15m,
+            "weight_30m": self._config.weight_30m,
+            "fallback_threshold_pct": self._config.fallback_threshold_pct,
         }
         entry = self._attempt_entry(
             symbol,
