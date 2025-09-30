@@ -57,9 +57,27 @@ class SymbolFinder(ABC):
 class TopVolumeSymbolFinder(SymbolFinder):
     """Pick symbols with the highest 24h turnover."""
 
+    def __init__(
+        self,
+        client: "BybitV5Client",
+        *,
+        category: str,
+        settle_coin: str = DEFAULT_SETTLE_COIN,
+        limit: int,
+        skip: int = 0,
+    ) -> None:
+        super().__init__(
+            client,
+            category=category,
+            settle_coin=settle_coin,
+            limit=limit,
+        )
+        self._skip = max(0, skip)
+
     def fetch(self) -> list[str]:  # noqa: D401 - abstract impl
         response = self._client.get_tickers(category=self._category)
         tickers = response.get("result", {}).get("list") or []
+
         def _volume_key(item: dict[str, Any]) -> float:
             for key in ("turnover24h", "volume24h", "usdIndexPrice"):
                 value = item.get(key)
@@ -68,17 +86,22 @@ class TopVolumeSymbolFinder(SymbolFinder):
                 except (TypeError, ValueError):
                     continue
             return 0.0
+
         sorted_tickers = sorted(
             tickers,
             key=_volume_key,
             reverse=True,
         )
         symbols: list[str] = []
+        skipped = 0
         for item in sorted_tickers:
             symbol = item.get("symbol")
             if not symbol:
                 continue
             if self._settle_coin and not self._is_settle_match(symbol):
+                continue
+            if skipped < self._skip:
+                skipped += 1
                 continue
             symbols.append(symbol.upper())
         return self._enforce_limit(symbols)
@@ -118,19 +141,41 @@ class NewListingSymbolFinder(SymbolFinder):
         return self._enforce_limit(symbols)
 
 
-_STRATEGY_FACTORIES: dict[str, Callable[["BybitV5Client", str, str, int], SymbolFinder]] = {
-    "top_volume": lambda client, category, settle_coin, limit: TopVolumeSymbolFinder(
+def _top_volume_factory(
+    client: "BybitV5Client",
+    category: str,
+    settle_coin: str,
+    limit: int,
+    *,
+    volume_skip: int = 0,
+) -> SymbolFinder:
+    return TopVolumeSymbolFinder(
         client,
         category=category,
         settle_coin=settle_coin,
         limit=limit,
-    ),
-    "new_listing": lambda client, category, settle_coin, limit: NewListingSymbolFinder(
+        skip=volume_skip,
+    )
+
+
+def _new_listing_factory(
+    client: "BybitV5Client",
+    category: str,
+    settle_coin: str,
+    limit: int,
+    **_: Any,
+) -> SymbolFinder:
+    return NewListingSymbolFinder(
         client,
         category=category,
         settle_coin=settle_coin,
         limit=limit,
-    ),
+    )
+
+
+_STRATEGY_FACTORIES: dict[str, Callable[..., SymbolFinder]] = {
+    "top_volume": _top_volume_factory,
+    "new_listing": _new_listing_factory,
 }
 
 
@@ -141,12 +186,19 @@ def create_symbol_finder(
     category: str,
     settle_coin: str,
     limit: int,
+    **options: Any,
 ) -> SymbolFinder:
     factory = _STRATEGY_FACTORIES.get(name.lower())
     if factory is None:
         valid = ", ".join(sorted(_STRATEGY_FACTORIES))
         raise ValueError(f"Unknown symbol discovery strategy '{name}'. Valid options: {valid}")
-    return factory(client, category, settle_coin, limit)
+    return factory(
+        client,
+        category,
+        settle_coin,
+        limit,
+        **options,
+    )
 
 
 __all__ = [

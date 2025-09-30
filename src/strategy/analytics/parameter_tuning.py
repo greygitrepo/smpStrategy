@@ -2,6 +2,8 @@ from __future__ import annotations
 
 """Online optimisation utilities for new-listing strategy parameters."""
 
+import argparse
+import copy
 import json
 import logging
 import random
@@ -12,6 +14,7 @@ from typing import Any, Dict, Iterable, Optional
 
 from src.config.new_listing_strategy_config import (
     NewListingStrategyConfig,
+    load_new_listing_strategy_config,
     write_new_listing_strategy_config,
 )
 from .models import TradeRecord
@@ -146,11 +149,75 @@ class AdaptiveParameterManager:
         features["fallback_threshold_pct"] = float(
             context.get("fallback_threshold_pct", self._config.fallback_threshold_pct)
         )
-        features["atr_ratio"] = float(context.get("atr_ratio", 0.0))
+        features["trend_filter_min_ema"] = float(
+            context.get("trend_filter_min_ema", self._config.trend_filter_min_ema)
+        )
+        features["trend_filter_min_atr"] = float(
+            context.get("trend_filter_min_atr", self._config.trend_filter_min_atr)
+        )
+        features["trend_filter_min_range_pct"] = float(
+            context.get("trend_filter_min_range_pct", self._config.trend_filter_min_range_pct)
+        )
+        features["trend_filter_max_reversals"] = float(
+            context.get("trend_filter_max_reversals", self._config.trend_filter_max_reversals)
+        )
+        features["trend_filter_range_lookback"] = float(
+            context.get("trend_filter_range_lookback", self._config.trend_filter_range_lookback)
+        )
+        features["trend_slope_window"] = float(
+            context.get("trend_slope_window", self._config.trend_slope_window)
+        )
+        features["trend_consistency_min_signals"] = float(
+            context.get(
+                "trend_consistency_min_signals",
+                self._config.trend_consistency_min_signals,
+            )
+        )
+        features["fallback_window"] = float(
+            context.get("fallback_window", self._config.fallback_window)
+        )
+        features["fallback_min_consecutive"] = float(
+            context.get(
+                "fallback_min_consecutive",
+                self._config.fallback_min_consecutive,
+            )
+        )
+        features["fallback_min_atr"] = float(
+            context.get("fallback_min_atr", self._config.fallback_min_atr)
+        )
+        features["fallback_max_ema"] = float(
+            context.get("fallback_max_ema", self._config.fallback_max_ema)
+        )
+        features["score_threshold"] = float(
+            context.get("score_threshold", self._config.score_threshold)
+        )
+        features["score_ema_weight"] = float(
+            context.get("score_ema_weight", self._config.score_ema_weight)
+        )
+        features["score_range_weight"] = float(
+            context.get("score_range_weight", self._config.score_range_weight)
+        )
+        features["score_atr_weight"] = float(
+            context.get("score_atr_weight", self._config.score_atr_weight)
+        )
+        features["score_reversal_penalty"] = float(
+            context.get(
+                "score_reversal_penalty",
+                self._config.score_reversal_penalty,
+            )
+        )
+        features["score_atr_ceiling"] = float(
+            context.get("score_atr_ceiling", self._config.score_atr_ceiling)
+        )
+        features["candidate_score"] = float(context.get("score", 0.0))
+        features["atr_ratio"] = float(context.get("atr_ratio", self._config.trend_filter_min_atr))
         features["ema_aggregate"] = float(trend.get("ema_aggregate", 0.0))
         direction = str(trend.get("direction", ""))
         features["is_long"] = 1.0 if direction.lower() == "long" else 0.0
         features["is_short"] = 1.0 if direction.lower() == "short" else 0.0
+        trend_filter_metrics = context.get("trend_filter", {})
+        features["trend_range_pct"] = float(trend_filter_metrics.get("range_pct", 0.0))
+        features["trend_reversals"] = float(trend_filter_metrics.get("reversals", 0.0))
         features["holding_minutes"] = trade.holding_seconds / 60.0
         return features
 
@@ -224,17 +291,26 @@ class AdaptiveParameterManager:
         projected.update(candidate)
         return projected
 
-    def _sample_candidate(self) -> Dict[str, float]:
+    def _sample_candidate(
+        self,
+        *,
+        rng: Optional[random.Random] = None,
+        vary: Optional[set[str]] = None,
+    ) -> Dict[str, float]:
+        generator = rng or random
         candidate: Dict[str, float] = {}
         for name, spec in self._param_specs.items():
             base = getattr(self._config, name)
+            if vary is not None and name not in vary:
+                candidate[name] = base
+                continue
             if spec["type"] == "int":
                 step = spec["variation"]
-                value = int(round(base + random.randint(-step, step)))
+                value = int(round(base + generator.randint(-step, step)))
                 value = max(spec["min"], min(spec["max"], value))
             else:
                 variation = spec["variation"]
-                value = base + random.uniform(-variation, variation)
+                value = base + generator.uniform(-variation, variation)
                 value = max(spec["min"], min(spec["max"], value))
                 value = round(value, 6)
             candidate[name] = value
@@ -311,6 +387,35 @@ class AdaptiveParameterManager:
             write_new_listing_strategy_config(self._config, self._optimized_config_path)
         except Exception as exc:  # noqa: BLE001
             logger.debug("Failed to persist optimized config snapshot: %s", exc)
+
+    def suggest_best_parameters(
+        self,
+        *,
+        samples: int = 256,
+        seed: Optional[int] = None,
+        vary: Optional[Iterable[str]] = None,
+    ) -> Optional[Dict[str, float]]:
+        if samples <= 0:
+            return None
+        if not self._feature_means:
+            logger.debug("Cannot suggest parameters: feature means unavailable (no trade data yet)")
+            return None
+        restrict = set(vary) if vary is not None else None
+        rng = random.Random(seed) if seed is not None else random
+        baseline_score = self._model.predict(self._project_features({}))
+        best_score = baseline_score
+        best_candidate: Optional[Dict[str, float]] = None
+        for _ in range(samples):
+            candidate = self._sample_candidate(rng=rng, vary=restrict)
+            score = self._model.predict(self._project_features(candidate))
+            if score > best_score + 1e-9:
+                best_score = score
+                best_candidate = candidate
+        if best_candidate is None:
+            logger.debug("Suggested parameters fall back to baseline; no improvement detected")
+        else:
+            logger.debug("Suggested parameters with predicted score %.6f (baseline %.6f)", best_score, baseline_score)
+        return best_candidate
 
     def _log_event(self, event: str, payload: Dict[str, Any]) -> None:
         record = {"event": event, "timestamp": datetime.now(timezone.utc).isoformat(), **payload}
@@ -406,7 +511,220 @@ class AdaptiveParameterManager:
             "weight_5m": {"type": "float", "min": 1.0, "max": 5.0, "variation": 0.3},
             "weight_15m": {"type": "float", "min": 0.5, "max": 4.0, "variation": 0.3},
             "weight_30m": {"type": "float", "min": 0.1, "max": 3.0, "variation": 0.3},
+            "trend_filter_min_ema": {
+                "type": "float",
+                "min": 0.001,
+                "max": 0.05,
+                "variation": 0.003,
+            },
+            "trend_filter_min_atr": {
+                "type": "float",
+                "min": 0.005,
+                "max": 0.1,
+                "variation": 0.005,
+            },
+            "trend_filter_min_range_pct": {
+                "type": "float",
+                "min": 0.002,
+                "max": 0.08,
+                "variation": 0.004,
+            },
+            "trend_filter_max_reversals": {
+                "type": "int",
+                "min": 0,
+                "max": 10,
+                "variation": 1,
+            },
+            "trend_filter_range_lookback": {
+                "type": "int",
+                "min": 6,
+                "max": 72,
+                "variation": 4,
+            },
+            "trend_slope_window": {
+                "type": "int",
+                "min": 1,
+                "max": 6,
+                "variation": 1,
+            },
+            "trend_consistency_min_signals": {
+                "type": "int",
+                "min": 1,
+                "max": 3,
+                "variation": 1,
+            },
+            "fallback_window": {
+                "type": "int",
+                "min": 1,
+                "max": 6,
+                "variation": 1,
+            },
+            "fallback_min_consecutive": {
+                "type": "int",
+                "min": 1,
+                "max": 5,
+                "variation": 1,
+            },
+            "fallback_min_atr": {
+                "type": "float",
+                "min": 0.002,
+                "max": 0.06,
+                "variation": 0.004,
+            },
+            "fallback_max_ema": {
+                "type": "float",
+                "min": 0.001,
+                "max": 0.04,
+                "variation": 0.003,
+            },
+            "score_threshold": {
+                "type": "float",
+                "min": 0.5,
+                "max": 5.0,
+                "variation": 0.3,
+            },
+            "score_ema_weight": {
+                "type": "float",
+                "min": 0.2,
+                "max": 2.0,
+                "variation": 0.2,
+            },
+            "score_range_weight": {
+                "type": "float",
+                "min": 0.2,
+                "max": 2.0,
+                "variation": 0.2,
+            },
+            "score_atr_weight": {
+                "type": "float",
+                "min": 0.1,
+                "max": 1.5,
+                "variation": 0.15,
+            },
+            "score_reversal_penalty": {
+                "type": "float",
+                "min": 0.1,
+                "max": 1.5,
+                "variation": 0.15,
+            },
+            "score_atr_ceiling": {
+                "type": "float",
+                "min": 2.0,
+                "max": 12.0,
+                "variation": 1.0,
+            },
         }
 
 
 __all__ = ["AdaptiveParameterManager"]
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Suggest optimized parameters from the online tuner state.")
+    parser.add_argument(
+        "--config",
+        default="analytics/newListingStrategy_optimized.ini",
+        help="Path to the base strategy config to load (defaults to optimized snapshot).",
+    )
+    parser.add_argument(
+        "--analytics-dir",
+        default="analytics",
+        help="Directory containing optimizer artifacts (history, model state).",
+    )
+    parser.add_argument(
+        "--samples",
+        type=int,
+        default=512,
+        help="Number of random candidates to evaluate when suggesting parameters.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Random seed for reproducible candidate sampling.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Compute and print the suggested parameters without writing them to disk.",
+    )
+    parser.add_argument(
+        "--output",
+        default=None,
+        help="Optional path to write the suggested config (defaults to --config path).",
+    )
+    parser.add_argument(
+        "--all-params",
+        action="store_true",
+        default=True,
+        help="Allow optimisation to adjust every tunable parameter instead of only the newly added ones.",
+    )
+    return parser.parse_args()
+
+
+def _initialize_manager(config_path: Path, analytics_dir: Path) -> AdaptiveParameterManager:
+    base_config = load_new_listing_strategy_config(config_path)
+    log_file = analytics_dir / "parameter_tuning.jsonl"
+    model_dir = analytics_dir / "optimizer"
+    optimized_path = config_path
+    manager = AdaptiveParameterManager(
+        config=copy.deepcopy(base_config),
+        log_file=log_file,
+        model_dir=model_dir,
+        optimized_config_path=optimized_path,
+        evaluation_trades=20,
+        evaluation_duration=timedelta(hours=2),
+        candidate_trade_interval=20,
+        candidate_time_interval=timedelta(hours=2),
+    )
+    return manager
+
+
+def _main() -> None:
+    new_param_names = {
+        "trend_slope_window",
+        "trend_consistency_min_signals",
+        "fallback_window",
+        "fallback_min_consecutive",
+        "fallback_min_atr",
+        "fallback_max_ema",
+        "score_threshold",
+        "score_ema_weight",
+        "score_range_weight",
+        "score_atr_weight",
+        "score_reversal_penalty",
+        "score_atr_ceiling",
+    }
+    args = _parse_args()
+    config_path = Path(args.config).expanduser()
+    analytics_dir = Path(args.analytics_dir).expanduser()
+    analytics_dir.mkdir(parents=True, exist_ok=True)
+    manager = _initialize_manager(config_path, analytics_dir)
+    vary = None if args.all_params else new_param_names
+    candidate = manager.suggest_best_parameters(samples=args.samples, seed=args.seed, vary=vary)
+    if not candidate:
+        print("Unable to suggest improved parameters; ensure optimizer has collected trade data." )
+        return
+    target_path = Path(args.output).expanduser() if args.output else config_path
+    try:
+        updated_config = load_new_listing_strategy_config(target_path)
+    except (FileNotFoundError, ValueError):
+        updated_config = copy.deepcopy(manager._config)
+    apply_keys = set(candidate.keys()) if args.all_params else new_param_names
+    suggested_values = {k: v for k, v in candidate.items() if k in apply_keys}
+    if not suggested_values:
+        print("No parameter suggestions produced; try allowing all parameters with --all-params.")
+        return
+    for name, value in suggested_values.items():
+        setattr(updated_config, name, value)
+    if args.dry_run:
+        print("Suggested parameters (dry-run, not saved):")
+        for key in sorted(suggested_values):
+            print(f"  {key} = {suggested_values[key]}")
+        return
+    write_new_listing_strategy_config(updated_config, target_path)
+    print(f"Suggested parameters written to {target_path}")
+
+
+if __name__ == "__main__":
+    _main()

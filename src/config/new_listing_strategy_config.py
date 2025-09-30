@@ -50,6 +50,23 @@ class NewListingStrategyConfig:
     atr_tp_bonus: float = 0.0
     tuning_min_total_trades: int = 30
     tuning_min_gap_trades: int = 15
+    trend_filter_min_ema: float = 0.005
+    trend_filter_min_atr: float = 0.015
+    trend_filter_min_range_pct: float = 0.01
+    trend_filter_max_reversals: int = 3
+    trend_filter_range_lookback: int = 12
+    trend_slope_window: int = 3
+    trend_consistency_min_signals: int = 2
+    fallback_window: int = 3
+    fallback_min_consecutive: int = 2
+    fallback_min_atr: float = 0.008
+    fallback_max_ema: float = 0.004
+    score_threshold: float = 1.5
+    score_ema_weight: float = 1.0
+    score_range_weight: float = 0.8
+    score_atr_weight: float = 0.6
+    score_reversal_penalty: float = 0.7
+    score_atr_ceiling: float = 5.0
 
     @property
     def weights(self) -> dict[str, float]:
@@ -216,6 +233,57 @@ def load_new_listing_strategy_config(
     max_new_positions = max(1, base.getint("max_new_positions", fallback=3))
     tuning_min_total_trades = max(1, base.getint("tuning_min_total_trades", fallback=30))
     tuning_min_gap_trades = max(1, base.getint("tuning_min_gap_trades", fallback=15))
+    trend_filter_min_ema = max(
+        0.0,
+        _normalize_percent(
+            base.getfloat("trend_filter_min_ema", fallback=0.6),
+            assume_percent=True,
+        ),
+    )
+    trend_filter_min_atr = max(
+        0.0,
+        _normalize_percent(
+            base.getfloat("trend_filter_min_atr", fallback=1.5),
+            assume_percent=True,
+        ),
+    )
+    trend_filter_min_range_pct = max(
+        0.0,
+        _normalize_percent(
+            base.getfloat("trend_filter_min_range_pct", fallback=0.8),
+            assume_percent=True,
+        ),
+    )
+    trend_filter_max_reversals = max(0, base.getint("trend_filter_max_reversals", fallback=3))
+    trend_filter_range_lookback = max(3, base.getint("trend_filter_range_lookback", fallback=12))
+    trend_slope_window = max(1, base.getint("trend_slope_window", fallback=3))
+    trend_consistency_min_signals = max(
+        1, base.getint("trend_consistency_min_signals", fallback=2)
+    )
+    fallback_window = max(1, base.getint("fallback_window", fallback=3))
+    fallback_min_consecutive = max(
+        1, base.getint("fallback_min_consecutive", fallback=2)
+    )
+    fallback_min_atr = max(
+        0.0,
+        _normalize_percent(
+            base.getfloat("fallback_min_atr", fallback=0.8),
+            assume_percent=True,
+        ),
+    )
+    fallback_max_ema = max(
+        0.0,
+        _normalize_percent(
+            base.getfloat("fallback_max_ema", fallback=0.4),
+            assume_percent=True,
+        ),
+    )
+    score_threshold = max(0.0, base.getfloat("score_threshold", fallback=1.5))
+    score_ema_weight = max(0.0, base.getfloat("score_ema_weight", fallback=1.0))
+    score_range_weight = max(0.0, base.getfloat("score_range_weight", fallback=0.8))
+    score_atr_weight = max(0.0, base.getfloat("score_atr_weight", fallback=0.6))
+    score_reversal_penalty = max(0.0, base.getfloat("score_reversal_penalty", fallback=0.7))
+    score_atr_ceiling = max(0.0, base.getfloat("score_atr_ceiling", fallback=5.0))
     requirement_sections: list[TimeframeRequirement] = []
     prefix = f"{base_section_name}."
     for section_name in parser.sections():
@@ -254,6 +322,23 @@ def load_new_listing_strategy_config(
         atr_tp_bonus=atr_tp_bonus,
         tuning_min_total_trades=tuning_min_total_trades,
         tuning_min_gap_trades=tuning_min_gap_trades,
+        trend_filter_min_ema=trend_filter_min_ema,
+        trend_filter_min_atr=trend_filter_min_atr,
+        trend_filter_min_range_pct=trend_filter_min_range_pct,
+        trend_filter_max_reversals=trend_filter_max_reversals,
+        trend_filter_range_lookback=trend_filter_range_lookback,
+        trend_slope_window=trend_slope_window,
+        trend_consistency_min_signals=trend_consistency_min_signals,
+        fallback_window=fallback_window,
+        fallback_min_consecutive=fallback_min_consecutive,
+        fallback_min_atr=fallback_min_atr,
+        fallback_max_ema=fallback_max_ema,
+        score_threshold=score_threshold,
+        score_ema_weight=score_ema_weight,
+        score_range_weight=score_range_weight,
+        score_atr_weight=score_atr_weight,
+        score_reversal_penalty=score_reversal_penalty,
+        score_atr_ceiling=score_atr_ceiling,
     )
     return config
 
@@ -318,6 +403,23 @@ def write_new_listing_strategy_config(
         "tuning_min_total_trades": str(config.tuning_min_total_trades),
         "tuning_min_gap_trades": str(config.tuning_min_gap_trades),
         "exclude_symbols": ", ".join(config.exclude_symbols),
+        "trend_filter_min_ema": _format_percent(config.trend_filter_min_ema),
+        "trend_filter_min_atr": _format_percent(config.trend_filter_min_atr),
+        "trend_filter_min_range_pct": _format_percent(config.trend_filter_min_range_pct),
+        "trend_filter_max_reversals": str(config.trend_filter_max_reversals),
+        "trend_filter_range_lookback": str(config.trend_filter_range_lookback),
+        "trend_slope_window": str(config.trend_slope_window),
+        "trend_consistency_min_signals": str(config.trend_consistency_min_signals),
+        "fallback_window": str(config.fallback_window),
+        "fallback_min_consecutive": str(config.fallback_min_consecutive),
+        "fallback_min_atr": _format_percent(config.fallback_min_atr),
+        "fallback_max_ema": _format_percent(config.fallback_max_ema),
+        "score_threshold": _format_float(config.score_threshold),
+        "score_ema_weight": _format_float(config.score_ema_weight),
+        "score_range_weight": _format_float(config.score_range_weight),
+        "score_atr_weight": _format_float(config.score_atr_weight),
+        "score_reversal_penalty": _format_float(config.score_reversal_penalty),
+        "score_atr_ceiling": _format_float(config.score_atr_ceiling),
     }
     if config.atr_sl_cap is not None:
         base_section["atr_sl_cap"] = _format_percent(config.atr_sl_cap)
@@ -366,9 +468,26 @@ def default_new_listing_strategy_config() -> NewListingStrategyConfig:
         exclude_symbols=(),
         atr_period=12,
         atr_skip_pct=0.075,
-        atr_sl_multiplier=1.0,
-        atr_sl_cap=0.036,
-        atr_tp_bonus=0.005,
+        atr_sl_multiplier=1.8,
+        atr_sl_cap=0.05,
+        atr_tp_bonus=0.0025,
         tuning_min_total_trades=30,
         tuning_min_gap_trades=15,
+        trend_filter_min_ema=0.006,
+        trend_filter_min_atr=0.015,
+        trend_filter_min_range_pct=0.008,
+        trend_filter_max_reversals=3,
+        trend_filter_range_lookback=12,
+        trend_slope_window=3,
+        trend_consistency_min_signals=2,
+        fallback_window=3,
+        fallback_min_consecutive=2,
+        fallback_min_atr=0.008,
+        fallback_max_ema=0.004,
+        score_threshold=1.5,
+        score_ema_weight=1.0,
+        score_range_weight=0.8,
+        score_atr_weight=0.6,
+        score_reversal_penalty=0.7,
+        score_atr_ceiling=5.0,
     )

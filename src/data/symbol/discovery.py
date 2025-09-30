@@ -43,6 +43,7 @@ class SymbolDiscoveryStrategy:
         strategy_name: Optional[str] = None,
         limit: Optional[int] = None,
         strategy_config: Optional["SymbolStrategyConfig"] = None,
+        volume_skip: Optional[int] = None,
     ) -> None:
         config = strategy_config or _maybe_load_symbol_strategy_config()
 
@@ -69,6 +70,11 @@ class SymbolDiscoveryStrategy:
         self._limit = (
             limit if limit is not None else (config.limit if config else None)
         ) or DEFAULT_SYMBOL_LIMIT
+        self._volume_skip = (
+            volume_skip
+            if volume_skip is not None
+            else ((config.volume_skip if config else None) or 0)
+        )
 
         self._client = client or build_client()
         self._store = store or DiscoveredSymbolStore(max_symbols=self._limit)
@@ -83,6 +89,7 @@ class SymbolDiscoveryStrategy:
             category=self._category,
             settle_coin=self._settle_coin,
             limit=self._limit,
+            volume_skip=self._volume_skip,
         )
 
         self._thread: Optional[threading.Thread] = None

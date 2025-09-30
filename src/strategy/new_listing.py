@@ -6,7 +6,7 @@ import json
 import logging
 import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional
@@ -64,6 +64,15 @@ class TimeframeDataResult:
 
     requirement: TimeframeRequirement
     frames: dict[str, list[Candle]]
+    metrics: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class CandidateScore:
+    """Prepared candidate metadata used for ranking symbols."""
+
+    symbol: str
+    score: float
 
 
 class NewListingTradingStrategy:
@@ -131,6 +140,7 @@ class NewListingTradingStrategy:
             candidate_time_interval=timedelta(hours=2),
         )
         self._trade_ledger.bootstrap(position_tracker.positions())
+        self._timeframe_cache: dict[str, TimeframeDataResult] = {}
 
     def run_once(self, *, initial_candidates: Optional[Iterable[str]] = None) -> None:
         if not self._config.enabled:
@@ -146,6 +156,7 @@ class NewListingTradingStrategy:
                 "Available balance is non-positive; wallet_available=%s", available
             )
             return
+        self._timeframe_cache = {}
         if initial_candidates is not None:
             symbols = [sym.upper() for sym in initial_candidates]
         else:
@@ -188,6 +199,26 @@ class NewListingTradingStrategy:
             logger.debug("No eligible symbols after filtering; skipping entry evaluation")
             return
         allocation_fraction = max(0.0, self._config.allocation_pct)
+
+        scored_candidates: list[CandidateScore] = []
+        for symbol in symbols:
+            analysis = self._score_candidate(symbol, active_symbols)
+            if analysis is None:
+                continue
+            scored_candidates.append(analysis)
+        if not scored_candidates:
+            logger.info("No candidates passed scoring filters; skipping run")
+            return
+        scored_candidates.sort(key=lambda item: item.score, reverse=True)
+        symbols = [item.symbol for item in scored_candidates]
+        max_considered_slots = min(open_slots, len(symbols))
+        logger.info(
+            "Candidate ranking (top %s): %s",
+            min(5, len(scored_candidates)),
+            ", ".join(
+                f"{item.symbol}({item.score:.3f})" for item in scored_candidates[: min(5, len(scored_candidates))]
+            ),
+        )
         new_positions_opened = 0
         for idx, symbol in enumerate(symbols):
             symbol = symbol.upper()
@@ -248,6 +279,89 @@ class NewListingTradingStrategy:
             if remaining_margin <= 0:
                 logger.info("Reached capital allocation margin limit; stopping evaluation loop")
                 break
+
+    def _score_candidate(
+        self,
+        symbol: str,
+        active_symbols: set[str],
+    ) -> Optional[CandidateScore]:
+        normalized = symbol.upper()
+        if normalized in active_symbols:
+            logger.debug("Skipping %s during scoring because position already active", normalized)
+            return None
+        timeframe_result = self._collect_timeframe_data(normalized)
+        if timeframe_result is None or not timeframe_result.frames:
+            return None
+        if not self._passes_trend_filter(normalized, timeframe_result):
+            return None
+        candles_5 = timeframe_result.frames.get("5m") or []
+        atr_ratio = timeframe_result.metrics.get("atr_ratio")
+        if atr_ratio is None:
+            atr_ratio = self._compute_atr_ratio(candles_5, self._config.atr_period)
+            if atr_ratio is None:
+                return None
+            timeframe_result.metrics["atr_ratio"] = atr_ratio
+        if self._config.atr_skip_pct > 0 and atr_ratio > self._config.atr_skip_pct:
+            return None
+        ema_scores_metric = timeframe_result.metrics.get("ema_scores")
+        ema_aggregate_metric = timeframe_result.metrics.get("ema_aggregate")
+        ema_positive_metric = timeframe_result.metrics.get("ema_positive")
+        ema_negative_metric = timeframe_result.metrics.get("ema_negative")
+        trend, trend_meta = self._determine_trend(
+            normalized,
+            timeframe_result.frames,
+            ema_scores=ema_scores_metric if isinstance(ema_scores_metric, dict) else None,
+            atr_ratio=atr_ratio,
+            ema_aggregate=(
+                float(ema_aggregate_metric)
+                if isinstance(ema_aggregate_metric, (int, float))
+                else None
+            ),
+            ema_positive=(
+                int(ema_positive_metric)
+                if isinstance(ema_positive_metric, (int, float))
+                else None
+            ),
+            ema_negative=(
+                int(ema_negative_metric)
+                if isinstance(ema_negative_metric, (int, float))
+                else None
+            ),
+        )
+        if trend is None:
+            return None
+        direction = 1 if trend.lower() == "long" else -1
+        timeframe_result.metrics["trend_direction"] = direction
+        timeframe_result.metrics["trend_meta"] = trend_meta
+        score = self._compute_candidate_score(timeframe_result, atr_ratio)
+        if score < self._config.score_threshold:
+            logger.debug(
+                "Discarding %s due to low score: %.3f < %.3f",
+                normalized,
+                score,
+                self._config.score_threshold,
+            )
+            return None
+        timeframe_result.metrics["score"] = score
+        self._timeframe_cache[normalized] = timeframe_result
+        return CandidateScore(symbol=normalized, score=score)
+
+    def _compute_candidate_score(
+        self,
+        timeframe_result: TimeframeDataResult,
+        atr_ratio: float,
+    ) -> float:
+        metrics = timeframe_result.metrics
+        ema_component = abs(float(metrics.get("ema_aggregate", 0.0))) * self._config.score_ema_weight
+        range_component = float(metrics.get("range_pct", 0.0)) * 100.0 * self._config.score_range_weight
+        atr_percent = min(atr_ratio * 100.0, self._config.score_atr_ceiling)
+        atr_component = atr_percent * self._config.score_atr_weight
+        reversals = float(metrics.get("reversals", 0.0))
+        direction = float(metrics.get("trend_direction", 1.0))
+        direction_bonus = 1.05 if direction > 0 else 1.0
+        score = direction_bonus * (ema_component + range_component + atr_component)
+        score -= reversals * self._config.score_reversal_penalty
+        return max(score, 0.0)
 
     # ----- Position management helpers -----
     def _safe_refresh_positions(self) -> dict[str, PositionSnapshot]:
@@ -484,6 +598,58 @@ class NewListingTradingStrategy:
                 "fallback_threshold_pct": decision_context.get(
                     "fallback_threshold_pct", self._config.fallback_threshold_pct
                 ),
+                "trend_filter_min_ema": decision_context.get(
+                    "trend_filter_min_ema", self._config.trend_filter_min_ema
+                ),
+                "trend_filter_min_atr": decision_context.get(
+                    "trend_filter_min_atr", self._config.trend_filter_min_atr
+                ),
+                "trend_filter_min_range_pct": decision_context.get(
+                    "trend_filter_min_range_pct", self._config.trend_filter_min_range_pct
+                ),
+                "trend_filter_max_reversals": decision_context.get(
+                    "trend_filter_max_reversals", self._config.trend_filter_max_reversals
+                ),
+                "trend_filter_range_lookback": decision_context.get(
+                    "trend_filter_range_lookback", self._config.trend_filter_range_lookback
+                ),
+                "trend_slope_window": decision_context.get(
+                    "trend_slope_window", self._config.trend_slope_window
+                ),
+                "trend_consistency_min_signals": decision_context.get(
+                    "trend_consistency_min_signals", self._config.trend_consistency_min_signals
+                ),
+                "fallback_window": decision_context.get(
+                    "fallback_window", self._config.fallback_window
+                ),
+                "fallback_min_consecutive": decision_context.get(
+                    "fallback_min_consecutive", self._config.fallback_min_consecutive
+                ),
+                "fallback_min_atr": decision_context.get(
+                    "fallback_min_atr", self._config.fallback_min_atr
+                ),
+                "fallback_max_ema": decision_context.get(
+                    "fallback_max_ema", self._config.fallback_max_ema
+                ),
+                "score": decision_context.get("score", 0.0),
+                "score_threshold": decision_context.get(
+                    "score_threshold", self._config.score_threshold
+                ),
+                "score_ema_weight": decision_context.get(
+                    "score_ema_weight", self._config.score_ema_weight
+                ),
+                "score_range_weight": decision_context.get(
+                    "score_range_weight", self._config.score_range_weight
+                ),
+                "score_atr_weight": decision_context.get(
+                    "score_atr_weight", self._config.score_atr_weight
+                ),
+                "score_reversal_penalty": decision_context.get(
+                    "score_reversal_penalty", self._config.score_reversal_penalty
+                ),
+                "score_atr_ceiling": decision_context.get(
+                    "score_atr_ceiling", self._config.score_atr_ceiling
+                ),
             }
         )
         self._trade_ledger.register_entry(
@@ -553,16 +719,33 @@ class NewListingTradingStrategy:
         if margin_cap <= 0:
             logger.debug("Skipping %s because margin cap is non-positive", symbol)
             return _skip("margin_cap_non_positive")
-        timeframe_result = self._collect_timeframe_data(symbol)
+        cached_result = self._timeframe_cache.pop(symbol.upper(), None)
+        timeframe_result = cached_result or self._collect_timeframe_data(symbol)
         if timeframe_result is None:
             return _skip("timeframe_data_unavailable")
         decision_details["requirement"] = timeframe_result.requirement.name
         frames = timeframe_result.frames
         if not frames:
             return _skip("timeframe_data_incomplete")
+        trend_passed = self._passes_trend_filter(symbol, timeframe_result)
+        trend_metrics = {
+            "ema_aggregate": round(timeframe_result.metrics.get("ema_aggregate", 0.0), 6),
+            "atr_ratio": round(timeframe_result.metrics.get("atr_ratio", 0.0), 6),
+            "range_pct": round(timeframe_result.metrics.get("range_pct", 0.0), 6),
+            "reversals": timeframe_result.metrics.get("reversals", 0),
+            "ema_positive": timeframe_result.metrics.get("ema_positive", 0),
+            "ema_negative": timeframe_result.metrics.get("ema_negative", 0),
+            "ema_window": timeframe_result.metrics.get("ema_window", self._config.trend_slope_window),
+            "score": round(timeframe_result.metrics.get("score", 0.0), 6),
+        }
+        if not trend_passed:
+            return _skip("trend_filter_rejected", {"trend_filter": trend_metrics})
         decision_details["candles"] = {tf: len(frames.get(tf, [])) for tf in ("5m", "15m", "30m")}
+        decision_details["trend_filter"] = trend_metrics
         candles_5m = frames.get("5m", [])
-        atr_ratio = self._compute_atr_ratio(candles_5m, self._config.atr_period)
+        atr_ratio = timeframe_result.metrics.get("atr_ratio")
+        if atr_ratio is None:
+            atr_ratio = self._compute_atr_ratio(candles_5m, self._config.atr_period)
         if atr_ratio is None:
             logger.debug("ATR unavailable for %s; insufficient candles", symbol)
             return _skip("atr_unavailable")
@@ -579,7 +762,31 @@ class NewListingTradingStrategy:
                 self._config.atr_skip_pct * 100.0,
             )
             return _skip("volatility_exceeds_threshold")
-        trend, trend_meta = self._determine_trend(symbol, frames)
+        ema_scores_metric = timeframe_result.metrics.get("ema_scores")
+        ema_aggregate_metric = timeframe_result.metrics.get("ema_aggregate")
+        ema_positive_metric = timeframe_result.metrics.get("ema_positive")
+        ema_negative_metric = timeframe_result.metrics.get("ema_negative")
+        trend, trend_meta = self._determine_trend(
+            symbol,
+            frames,
+            ema_scores=ema_scores_metric if isinstance(ema_scores_metric, dict) else None,
+            atr_ratio=atr_ratio,
+            ema_aggregate=(
+                float(ema_aggregate_metric)
+                if isinstance(ema_aggregate_metric, (int, float))
+                else None
+            ),
+            ema_positive=(
+                int(ema_positive_metric)
+                if isinstance(ema_positive_metric, (int, float))
+                else None
+            ),
+            ema_negative=(
+                int(ema_negative_metric)
+                if isinstance(ema_negative_metric, (int, float))
+                else None
+            ),
+        )
         if trend is None:
             logger.info("Trend indeterminate for %s; skipping entry (EMA score missing)", symbol)
             return _skip("trend_indeterminate", {"trend": trend_meta})
@@ -600,6 +807,25 @@ class NewListingTradingStrategy:
             "weight_15m": self._config.weight_15m,
             "weight_30m": self._config.weight_30m,
             "fallback_threshold_pct": self._config.fallback_threshold_pct,
+            "trend_filter": trend_metrics,
+            "trend_filter_min_ema": self._config.trend_filter_min_ema,
+            "trend_filter_min_atr": self._config.trend_filter_min_atr,
+            "trend_filter_min_range_pct": self._config.trend_filter_min_range_pct,
+            "trend_filter_max_reversals": self._config.trend_filter_max_reversals,
+            "trend_filter_range_lookback": self._config.trend_filter_range_lookback,
+            "trend_slope_window": self._config.trend_slope_window,
+            "trend_consistency_min_signals": self._config.trend_consistency_min_signals,
+            "fallback_window": self._config.fallback_window,
+            "fallback_min_consecutive": self._config.fallback_min_consecutive,
+            "fallback_min_atr": self._config.fallback_min_atr,
+            "fallback_max_ema": self._config.fallback_max_ema,
+            "score": trend_metrics["score"],
+            "score_threshold": self._config.score_threshold,
+            "score_ema_weight": self._config.score_ema_weight,
+            "score_range_weight": self._config.score_range_weight,
+            "score_atr_weight": self._config.score_atr_weight,
+            "score_reversal_penalty": self._config.score_reversal_penalty,
+            "score_atr_ceiling": self._config.score_atr_ceiling,
         }
         entry = self._attempt_entry(
             symbol,
@@ -653,17 +879,18 @@ class NewListingTradingStrategy:
             symbol,
             available_30,
         )
-        candles_30 = candles_30[-max(requirement.min_30m, self._config.ema_period + 1) :]
+        ema_window_requirement = self._config.ema_period + self._config.trend_slope_window
+        candles_30 = candles_30[-max(requirement.min_30m, ema_window_requirement) :]
         candles_15 = self._fetch_candles(
             symbol,
             "15",
-            max(requirement.min_15m, self._config.ema_period + 1),
+            max(requirement.min_15m, ema_window_requirement),
         )
         min_5m_required = max(requirement.min_5m, self._config.min_5m_bars)
         candles_5 = self._fetch_candles(
             symbol,
             "5",
-            max(min_5m_required, self._config.ema_period + 1),
+            max(min_5m_required, ema_window_requirement),
         )
         if len(candles_30) < requirement.min_30m or len(candles_15) < requirement.min_15m:
             logger.debug(
@@ -687,6 +914,111 @@ class NewListingTradingStrategy:
             "30m": candles_30,
         }
         return TimeframeDataResult(requirement=requirement, frames=frames)
+
+    def _passes_trend_filter(
+        self,
+        symbol: str,
+        timeframe_result: TimeframeDataResult,
+    ) -> bool:
+        frames = timeframe_result.frames
+        candles_5 = frames.get("5m") or []
+        if len(candles_5) < max(2, self._config.trend_filter_range_lookback):
+            logger.debug("Trend filter skipping %s due to insufficient 5m candles", symbol)
+            return False
+        ema_window = max(1, self._config.trend_slope_window)
+        try:
+            ema_scores = self._compute_ema_scores(frames)
+            aggregate = sum(ema_scores.values())
+        except ValueError as exc:
+            logger.debug("Trend filter EMA computation failed for %s: %s", symbol, exc)
+            return False
+        timeframe_result.metrics["ema_scores"] = dict(ema_scores)
+        timeframe_result.metrics["ema_aggregate"] = aggregate
+        positive_signals = sum(1 for value in ema_scores.values() if value > 0)
+        negative_signals = sum(1 for value in ema_scores.values() if value < 0)
+        timeframe_result.metrics["ema_positive"] = positive_signals
+        timeframe_result.metrics["ema_negative"] = negative_signals
+        timeframe_result.metrics["ema_window"] = ema_window
+        min_ema_threshold = self._config.trend_filter_min_ema * 100.0
+        if abs(aggregate) < min_ema_threshold:
+            logger.debug(
+                "Trend filter rejected %s: |ema_aggregate| %.4f < %.4f",
+                symbol,
+                aggregate,
+                min_ema_threshold,
+            )
+            return False
+        required_consistency = max(1, self._config.trend_consistency_min_signals)
+        if aggregate > 0 and positive_signals < required_consistency:
+            logger.debug(
+                "Trend filter rejected %s: positive EMA signals %s < %s",
+                symbol,
+                positive_signals,
+                required_consistency,
+            )
+            return False
+        if aggregate < 0 and negative_signals < required_consistency:
+            logger.debug(
+                "Trend filter rejected %s: negative EMA signals %s < %s",
+                symbol,
+                negative_signals,
+                required_consistency,
+            )
+            return False
+        atr_ratio = timeframe_result.metrics.get("atr_ratio")
+        if atr_ratio is None:
+            atr_ratio = self._compute_atr_ratio(candles_5, self._config.atr_period) or 0.0
+            timeframe_result.metrics["atr_ratio"] = atr_ratio
+        if atr_ratio < self._config.trend_filter_min_atr:
+            logger.debug(
+                "Trend filter rejected %s due to low ATR ratio %.4f < %.4f",
+                symbol,
+                atr_ratio,
+                self._config.trend_filter_min_atr,
+            )
+            return False
+        lookback = min(len(candles_5), self._config.trend_filter_range_lookback)
+        window = candles_5[-lookback:]
+        high = max(c.high for c in window)
+        low = min(c.low for c in window)
+        last_close = window[-1].close if window else 0.0
+        range_pct = ((high - low) / last_close) if last_close > 0 else 0.0
+        timeframe_result.metrics["range_pct"] = range_pct
+        if range_pct < self._config.trend_filter_min_range_pct:
+            logger.debug(
+                "Trend filter rejected %s due to narrow range %.4f < %.4f",
+                symbol,
+                range_pct,
+                self._config.trend_filter_min_range_pct,
+            )
+            return False
+        reversals = self._count_trend_reversals([c.close for c in window])
+        timeframe_result.metrics["reversals"] = reversals
+        if reversals > self._config.trend_filter_max_reversals:
+            logger.debug(
+                "Trend filter rejected %s due to reversals %s > %s",
+                symbol,
+                reversals,
+                self._config.trend_filter_max_reversals,
+            )
+            return False
+        logger.debug(
+            "Trend filter accepted %s with metrics: ema=%.4f (min=%.4f) signals=+%s/-%s (req=%s window=%s) atr=%.4f (min=%.4f) range=%.4f (min=%.4f) reversals=%s (max=%s)",
+            symbol,
+            timeframe_result.metrics.get("ema_aggregate", 0.0),
+            self._config.trend_filter_min_ema * 100.0,
+            positive_signals,
+            negative_signals,
+            required_consistency,
+            ema_window,
+            timeframe_result.metrics.get("atr_ratio", 0.0),
+            self._config.trend_filter_min_atr,
+            timeframe_result.metrics.get("range_pct", 0.0),
+            self._config.trend_filter_min_range_pct,
+            timeframe_result.metrics.get("reversals", 0),
+            self._config.trend_filter_max_reversals,
+        )
+        return True
 
     def _compute_atr_ratio(
         self,
@@ -714,6 +1046,20 @@ class NewListingTradingStrategy:
         if price <= 0:
             return None
         return atr / price
+
+    @staticmethod
+    def _count_trend_reversals(closes: list[float]) -> int:
+        reversals = 0
+        last_sign = 0
+        for idx in range(1, len(closes)):
+            diff = closes[idx] - closes[idx - 1]
+            if diff == 0:
+                continue
+            sign = 1 if diff > 0 else -1
+            if last_sign and sign != last_sign:
+                reversals += 1
+            last_sign = sign
+        return reversals
 
     def _select_requirement(
         self,
@@ -773,31 +1119,65 @@ class NewListingTradingStrategy:
         self,
         symbol: str,
         timeframe_data: dict[str, list[Candle]],
+        *,
+        ema_scores: Optional[dict[str, float]] = None,
+        atr_ratio: Optional[float] = None,
+        ema_aggregate: Optional[float] = None,
+        ema_positive: Optional[int] = None,
+        ema_negative: Optional[int] = None,
     ) -> tuple[Optional[str], dict[str, Any]]:
         meta: dict[str, Any] = {}
-        ema_scores: Optional[dict[str, float]]
-        try:
-            ema_scores = self._compute_ema_scores(timeframe_data)
-        except ValueError as exc:
-            logger.debug("EMA score computation failed for %s: %s", symbol, exc)
-            meta["ema_error"] = str(exc)
-            ema_scores = None
-        if ema_scores:
-            aggregate = sum(ema_scores.values())
-            logger.debug("EMA trend scores for %s: %s (aggregate=%.6f)", symbol, ema_scores, aggregate)
+        local_scores = ema_scores
+        if local_scores is None:
+            try:
+                local_scores = self._compute_ema_scores(timeframe_data)
+            except ValueError as exc:
+                logger.debug("EMA score computation failed for %s: %s", symbol, exc)
+                meta["ema_error"] = str(exc)
+                local_scores = None
+        if local_scores:
+            aggregate = ema_aggregate if ema_aggregate is not None else sum(local_scores.values())
+            positive = (
+                ema_positive
+                if ema_positive is not None
+                else sum(1 for value in local_scores.values() if value > 0)
+            )
+            negative = (
+                ema_negative
+                if ema_negative is not None
+                else sum(1 for value in local_scores.values() if value < 0)
+            )
+            logger.debug(
+                "EMA trend scores for %s: %s (aggregate=%.6f pos=%s neg=%s)",
+                symbol,
+                local_scores,
+                aggregate,
+                positive,
+                negative,
+            )
             meta.update(
                 {
                     "method": "ema",
-                    "ema_scores": {key: round(value, 6) for key, value in ema_scores.items()},
+                    "ema_scores": {key: round(value, 6) for key, value in local_scores.items()},
                     "ema_aggregate": round(aggregate, 6),
+                    "ema_positive": positive,
+                    "ema_negative": negative,
+                    "ema_window": self._config.trend_slope_window,
+                    "consistency_min_signals": self._config.trend_consistency_min_signals,
                 }
             )
             if aggregate > 0:
                 return "Long", meta
             if aggregate < 0:
                 return "Short", meta
+            ema_aggregate = aggregate
         logger.debug("EMA analysis inconclusive for %s; attempting fallback", symbol)
-        fallback_trend, fallback_meta = self._fallback_trend(symbol, timeframe_data.get("5m", []))
+        fallback_trend, fallback_meta = self._fallback_trend(
+            symbol,
+            timeframe_data.get("5m", []),
+            atr_ratio=atr_ratio,
+            ema_aggregate=ema_aggregate,
+        )
         meta.update(fallback_meta)
         return fallback_trend, meta
 
@@ -805,19 +1185,25 @@ class NewListingTradingStrategy:
         period = self._config.ema_period
         if period < 2:
             raise ValueError("EMA period must be >= 2")
+        window = max(1, self._config.trend_slope_window)
         scores: dict[str, float] = {}
         for tf in ("5m", "15m", "30m"):
             candles = timeframe_data.get(tf)
-            if not candles or len(candles) < period + 1:
+            if not candles or len(candles) < period + window:
                 raise ValueError(f"Not enough candles for {tf}")
             closes = [c.close for c in candles]
             ema_values = self._ema(closes, period)
-            if len(ema_values) < 2:
-                raise ValueError(f"EMA length too short for {tf}")
-            prev, latest = ema_values[-2], ema_values[-1]
-            if prev == 0:
-                raise ValueError(f"Previous EMA is zero for {tf}")
-            slope_pct = ((latest - prev) / prev) * 100.0
+            if len(ema_values) < window + 1:
+                raise ValueError(f"EMA length too short for windowed slope on {tf}")
+            recent = ema_values[-(window + 1) :]
+            slopes: list[float] = []
+            for prev, latest in zip(recent, recent[1:]):
+                if prev == 0:
+                    raise ValueError(f"Previous EMA is zero for {tf}")
+                slopes.append(((latest - prev) / prev) * 100.0)
+            if not slopes:
+                raise ValueError(f"Unable to compute EMA slope window for {tf}")
+            slope_pct = sum(slopes) / len(slopes)
             weight = self._config.weights[tf]
             scores[tf] = slope_pct * weight
         return scores
@@ -838,41 +1224,118 @@ class NewListingTradingStrategy:
         self,
         symbol: str,
         candles_5m: list[Candle],
+        *,
+        atr_ratio: Optional[float],
+        ema_aggregate: Optional[float],
     ) -> tuple[Optional[str], dict[str, Any]]:
-        meta: dict[str, Any] = {"method": "fallback"}
+        config = self._config
+        window = max(1, config.fallback_window)
+        min_consecutive = max(1, config.fallback_min_consecutive)
+        threshold_pct = config.fallback_threshold_pct * 100.0
+        min_atr = config.fallback_min_atr
+        max_ema = config.fallback_max_ema * 100.0
+        meta: dict[str, Any] = {
+            "method": "fallback",
+            "window": window,
+            "min_consecutive": min_consecutive,
+            "threshold_pct": config.fallback_threshold_pct,
+            "min_atr": min_atr,
+            "max_ema": config.fallback_max_ema,
+        }
         if not candles_5m:
             logger.debug("Fallback trend skipped for %s: missing 5m data", symbol)
             meta["reason"] = "missing_5m_data"
+            meta["fallback_triggered"] = False
             return None, meta
-        last = candles_5m[-1]
-        if last.open <= 0:
-            logger.debug("Invalid open price in fallback for %s: %s", symbol, last)
+        if atr_ratio is None or atr_ratio < min_atr:
+            logger.debug(
+                "Fallback trend skipped for %s: atr_ratio %.6f < %.6f",
+                symbol,
+                atr_ratio or 0.0,
+                min_atr,
+            )
+            meta.update({"reason": "atr_below_min", "atr_ratio": atr_ratio or 0.0, "fallback_triggered": False})
+            return None, meta
+        if ema_aggregate is not None and abs(ema_aggregate) > max_ema:
+            logger.debug(
+                "Fallback trend skipped for %s: |ema_aggregate| %.6f > %.6f",
+                symbol,
+                ema_aggregate,
+                max_ema,
+            )
+            meta.update(
+                {
+                    "reason": "ema_not_flat",
+                    "ema_aggregate": round(ema_aggregate, 6),
+                    "fallback_triggered": False,
+                }
+            )
+            return None, meta
+        if len(candles_5m) < window:
+            logger.debug(
+                "Fallback trend skipped for %s: only %s candles < window %s",
+                symbol,
+                len(candles_5m),
+                window,
+            )
+            meta.update(
+                {
+                    "reason": "insufficient_candles",
+                    "available_candles": len(candles_5m),
+                    "fallback_triggered": False,
+                }
+            )
+            return None, meta
+        recent = candles_5m[-window:]
+        start_candle = recent[0]
+        end_candle = recent[-1]
+        if start_candle.open <= 0:
+            logger.debug("Invalid open price in fallback for %s: %s", symbol, start_candle)
             meta["reason"] = "invalid_open"
+            meta["fallback_triggered"] = False
             return None, meta
-        change_pct = ((last.close - last.open) / last.open) * 100.0
-        threshold = self._config.fallback_threshold_pct
+        change_pct = ((end_candle.close - start_candle.open) / start_candle.open) * 100.0
         meta.update(
             {
                 "change_pct": round(change_pct, 6),
-                "threshold_pct": threshold,
+                "atr_ratio": atr_ratio,
             }
         )
-        logger.debug(
-            "Fallback change for %s: %.4f%% (threshold=%.2f%%)",
-            symbol,
-            change_pct,
-            threshold,
+        if abs(change_pct) < threshold_pct:
+            logger.debug(
+                "Fallback trend skipped for %s: move %.4f%% below threshold %.4f%%",
+                symbol,
+                change_pct,
+                threshold_pct,
+            )
+            meta["reason"] = "move_below_threshold"
+            meta["fallback_triggered"] = False
+            return None, meta
+        direction_sign = 1 if change_pct > 0 else -1
+        if direction_sign == 0:
+            meta["reason"] = "flat_move"
+            meta["fallback_triggered"] = False
+            return None, meta
+        consecutive_required = min(min_consecutive, len(candles_5m))
+        consecutive_slice = candles_5m[-consecutive_required:]
+        consistent = all(
+            (candle.close - candle.open > 0)
+            if direction_sign > 0
+            else (candle.close - candle.open < 0)
+            for candle in consecutive_slice
         )
-        if change_pct >= threshold:
-            meta["fallback_triggered"] = True
-            meta["direction"] = "Long"
-            return "Long", meta
-        if change_pct <= -threshold:
-            meta["fallback_triggered"] = True
-            meta["direction"] = "Short"
-            return "Short", meta
-        meta["fallback_triggered"] = False
-        return None, meta
+        if not consistent:
+            meta["reason"] = "direction_not_consistent"
+            meta["fallback_triggered"] = False
+            return None, meta
+        meta.update(
+            {
+                "fallback_triggered": True,
+                "direction": "Long" if direction_sign > 0 else "Short",
+                "consecutive_checked": consecutive_required,
+            }
+        )
+        return ("Long" if direction_sign > 0 else "Short"), meta
 
     def _attempt_entry(
         self,

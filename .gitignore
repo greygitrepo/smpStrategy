@@ -16,3 +16,5 @@ log/
 src/strategy/analytics/__pycache__/
 
 src/strategy/__pycache__/
+
+src/run/__pycache__/

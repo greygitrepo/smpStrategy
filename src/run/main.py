@@ -58,6 +58,8 @@ def _setup_logging() -> tuple[Path, datetime]:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_file = log_dir / f"smpStrategy_{timestamp}.log"
     _configure_logging(log_file)
+    logging.getLogger("smpStrategy.strategy.new_listing").setLevel(logging.DEBUG)
+    logging.getLogger("smpStrategy.strategy.new_listing").setLevel(logging.DEBUG)
     return log_file, datetime.now()
 
 

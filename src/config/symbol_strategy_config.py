@@ -27,6 +27,7 @@ class SymbolStrategyConfig:
     refresh_interval: float = DEFAULT_DISCOVERY_INTERVAL
     category: str = DEFAULT_CATEGORY
     settle_coin: str = DEFAULT_SETTLE_COIN
+    volume_skip: int = 0
 
 
 def _parse_config(parser: configparser.ConfigParser, path: Path) -> SymbolStrategyConfig:
@@ -42,12 +43,14 @@ def _parse_config(parser: configparser.ConfigParser, path: Path) -> SymbolStrate
     )
     category = section.get("category", fallback=DEFAULT_CATEGORY).strip() or DEFAULT_CATEGORY
     settle_coin = section.get("settle_coin", fallback=DEFAULT_SETTLE_COIN).strip() or DEFAULT_SETTLE_COIN
+    volume_skip = max(0, section.getint("volume_skip", fallback=0))
     return SymbolStrategyConfig(
         strategy=strategy,
         limit=max(1, limit),
         refresh_interval=max(1.0, refresh_interval),
         category=category,
         settle_coin=settle_coin,
+        volume_skip=volume_skip,
     )
 
 
