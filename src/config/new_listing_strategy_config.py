@@ -106,7 +106,7 @@ _DEFAULT_REQUIREMENTS: tuple[TimeframeRequirement, ...] = (
 
 
 def _normalize_percent(value: float, *, assume_percent: bool = False) -> float:
-    if assume_percent and value > 1:
+    if assume_percent and value >= 1:
         return value / 100.0
     return value
 
@@ -392,7 +392,7 @@ def write_new_listing_strategy_config(
         "weight_30m": _format_float(config.weight_30m),
         "fallback_threshold_pct": _format_percent(config.fallback_threshold_pct),
         "allocation_pct": _format_percent(config.allocation_pct),
-        "tp_pct": _format_float(config.tp_pct),
+        "tp_pct": _format_percent(config.tp_pct),
         "sl_pct": _format_percent(config.sl_pct),
         "min_5m_bars": str(config.min_5m_bars),
         "max_new_positions": str(config.max_new_positions),
@@ -404,7 +404,7 @@ def write_new_listing_strategy_config(
         "tuning_min_gap_trades": str(config.tuning_min_gap_trades),
         "exclude_symbols": ", ".join(config.exclude_symbols),
         "trend_filter_min_ema": _format_float(config.trend_filter_min_ema),
-        "trend_filter_min_atr": _format_percent(config.trend_filter_min_atr),
+        "trend_filter_min_atr": _format_float(config.trend_filter_min_atr),
         "trend_filter_min_range_pct": _format_float(config.trend_filter_min_range_pct),
         "trend_filter_max_reversals": str(config.trend_filter_max_reversals),
         "trend_filter_range_lookback": str(config.trend_filter_range_lookback),
