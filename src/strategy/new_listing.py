@@ -129,16 +129,21 @@ class NewListingTradingStrategy:
             history_file=history_file,
             output_file=performance_file,
         )
-        self._parameter_manager = AdaptiveParameterManager(
-            config=self._config,
-            log_file=tuning_log_file,
-            model_dir=optimizer_root,
-            optimized_config_path=optimized_config_path,
-            evaluation_trades=20,
-            evaluation_duration=timedelta(hours=2),
-            candidate_trade_interval=20,
-            candidate_time_interval=timedelta(hours=2),
-        )
+        self._parameter_manager: Optional[AdaptiveParameterManager]
+        if self._config.enable_parameter_tuner:
+            self._parameter_manager = AdaptiveParameterManager(
+                config=self._config,
+                log_file=tuning_log_file,
+                model_dir=optimizer_root,
+                optimized_config_path=optimized_config_path,
+                evaluation_trades=20,
+                evaluation_duration=timedelta(hours=2),
+                candidate_trade_interval=20,
+                candidate_time_interval=timedelta(hours=2),
+            )
+        else:
+            self._parameter_manager = None
+            logger.info("Parameter tuner disabled via config")
         self._trade_ledger.bootstrap(position_tracker.positions())
         self._timeframe_cache: dict[str, TimeframeDataResult] = {}
 
@@ -678,10 +683,11 @@ class NewListingTradingStrategy:
                 snapshot = self._performance_tracker.record(closed_records)
             except Exception as exc:  # noqa: BLE001
                 logger.debug("Performance tracker update failed: %s", exc)
-        try:
-            self._parameter_manager.process_trades(closed_records, snapshot)
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("Parameter manager processing failed: %s", exc)
+        if self._parameter_manager:
+            try:
+                self._parameter_manager.process_trades(closed_records, snapshot)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Parameter manager processing failed: %s", exc)
 
     # ----- Symbol evaluation -----
     def _fetch_candidate_symbols(self) -> list[str]:

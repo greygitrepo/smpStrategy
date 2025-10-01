@@ -30,6 +30,7 @@ class NewListingStrategyConfig:
     """Top-level configuration values for the new-listing strategy."""
 
     enabled: bool = True
+    enable_parameter_tuner: bool = True
     ema_period: int = 9
     leverage: float = 3.0
     weight_5m: float = 3.0
@@ -168,6 +169,7 @@ def load_new_listing_strategy_config(
         )
     base = parser[base_section_name]
     enabled = base.getboolean("enabled", fallback=True)
+    enable_parameter_tuner = base.getboolean("enable_parameter_tuner", fallback=True)
     ema_period = max(2, base.getint("ema_period", fallback=9))
     leverage = max(
         1.0,
@@ -303,6 +305,7 @@ def load_new_listing_strategy_config(
     config = NewListingStrategyConfig(
         enabled=enabled,
         ema_period=ema_period,
+        enable_parameter_tuner=enable_parameter_tuner,
         weight_5m=base.getfloat("weight_5m", fallback=3.0),
         weight_15m=base.getfloat("weight_15m", fallback=2.0),
         weight_30m=base.getfloat("weight_30m", fallback=1.0),
@@ -385,6 +388,7 @@ def write_new_listing_strategy_config(
     section_name = "new_listing_strategy"
     base_section = {
         "enabled": "true" if config.enabled else "false",
+        "enable_parameter_tuner": "true" if config.enable_parameter_tuner else "false",
         "ema_period": str(config.ema_period),
         "leverage": _format_float(config.leverage),
         "weight_5m": _format_float(config.weight_5m),
@@ -453,6 +457,7 @@ def default_new_listing_strategy_config() -> NewListingStrategyConfig:
 
     return NewListingStrategyConfig(
         leverage=3.0,
+        enable_parameter_tuner=True,
         requirements=tuple(
             TimeframeRequirement(
                 name=req.name,
