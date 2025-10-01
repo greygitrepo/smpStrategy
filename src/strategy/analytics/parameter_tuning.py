@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 
 from src.config.new_listing_strategy_config import (
+    MIN_TP_PCT,
     NewListingStrategyConfig,
     load_new_listing_strategy_config,
     write_new_listing_strategy_config,
@@ -25,7 +26,7 @@ logger = logging.getLogger("smpStrategy.analytics.optimizer")
 class OnlineLinearRegressor:
     """Simple online linear regressor trained with SGD."""
 
-    def __init__(self, learning_rate: float = 0.001) -> None:
+    def __init__(self, learning_rate: float = 0.0015) -> None:
         self.learning_rate = learning_rate
         self.weights: Dict[str, float] = {}
         self.bias: float = 0.0
@@ -503,7 +504,7 @@ class AdaptiveParameterManager:
     def _build_param_specs(self) -> Dict[str, Dict[str, Any]]:
         return {
             "allocation_pct": {"type": "float", "min": 0.01, "max": 0.2, "variation": 0.02},
-            "tp_pct": {"type": "float", "min": 0.005, "max": 0.06, "variation": 0.005},
+            "tp_pct": {"type": "float", "min": MIN_TP_PCT, "max": 0.06, "variation": 0.005},
             "sl_pct": {"type": "float", "min": 0.004, "max": 0.08, "variation": 0.006},
             "atr_skip_pct": {"type": "float", "min": 0.005, "max": 0.2, "variation": 0.01},
             "fallback_threshold_pct": {"type": "float", "min": 0.005, "max": 0.12, "variation": 0.01},
@@ -672,10 +673,10 @@ def _initialize_manager(config_path: Path, analytics_dir: Path) -> AdaptiveParam
         log_file=log_file,
         model_dir=model_dir,
         optimized_config_path=optimized_path,
-        evaluation_trades=20,
-        evaluation_duration=timedelta(hours=2),
-        candidate_trade_interval=20,
-        candidate_time_interval=timedelta(hours=2),
+        evaluation_trades=15,
+        evaluation_duration=timedelta(hours=1),
+        candidate_trade_interval=15,
+        candidate_time_interval=timedelta(hours=1),
     )
     return manager
 

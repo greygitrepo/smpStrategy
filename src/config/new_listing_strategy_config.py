@@ -12,6 +12,8 @@ _CONFIG_ENV_VAR = "NEW_LISTING_STRATEGY_CONFIG"
 _DEFAULT_FILE_NAME = "newListingStrategy.ini"
 _CONFIG_DIR = Path(__file__).resolve().parents[2] / "config"
 
+MIN_TP_PCT = 0.012  # enforce 1.2% floor for take-profit percentage
+
 
 @dataclass(slots=True)
 class TimeframeRequirement:
@@ -218,7 +220,7 @@ def load_new_listing_strategy_config(
         ),
     )
     tp_pct = max(
-        0.0,
+        MIN_TP_PCT,
         _normalize_percent(
             base.getfloat("tp_pct", fallback=1.4),
             assume_percent=True,
@@ -396,7 +398,7 @@ def write_new_listing_strategy_config(
         "weight_30m": _format_float(config.weight_30m),
         "fallback_threshold_pct": _format_percent(config.fallback_threshold_pct),
         "allocation_pct": _format_percent(config.allocation_pct),
-        "tp_pct": _format_percent(config.tp_pct),
+        "tp_pct": _format_percent(max(MIN_TP_PCT, config.tp_pct)),
         "sl_pct": _format_percent(config.sl_pct),
         "min_5m_bars": str(config.min_5m_bars),
         "max_new_positions": str(config.max_new_positions),
