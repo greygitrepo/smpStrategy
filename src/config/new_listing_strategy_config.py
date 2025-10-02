@@ -44,6 +44,7 @@ class NewListingStrategyConfig:
     sl_pct: float = 0.014
     min_5m_bars: int = 20
     max_new_positions: int = 3
+    max_min_margin_share: float = 0.25
     requirements: tuple[TimeframeRequirement, ...] = ()
     exclude_symbols: tuple[str, ...] = ()
     atr_period: int = 14
@@ -184,6 +185,16 @@ def load_new_listing_strategy_config(
             assume_percent=True,
         ),
     )
+    max_min_margin_share = max(
+        0.0,
+        min(
+            1.0,
+            _normalize_percent(
+                base.getfloat("max_min_margin_share", fallback=25.0),
+                assume_percent=True,
+            ),
+        ),
+    )
     fallback_threshold_pct = max(
         0.0,
         _normalize_percent(
@@ -314,6 +325,7 @@ def load_new_listing_strategy_config(
         fallback_threshold_pct=fallback_threshold_pct,
         leverage=leverage,
         allocation_pct=allocation_pct,
+        max_min_margin_share=max_min_margin_share,
         tp_pct=tp_pct,
         sl_pct=sl_pct,
         min_5m_bars=min_5m_bars,
@@ -398,6 +410,7 @@ def write_new_listing_strategy_config(
         "weight_30m": _format_float(config.weight_30m),
         "fallback_threshold_pct": _format_percent(config.fallback_threshold_pct),
         "allocation_pct": _format_percent(config.allocation_pct),
+        "max_min_margin_share": _format_percent(config.max_min_margin_share),
         "tp_pct": _format_percent(max(MIN_TP_PCT, config.tp_pct)),
         "sl_pct": _format_percent(config.sl_pct),
         "min_5m_bars": str(config.min_5m_bars),
@@ -472,6 +485,7 @@ def default_new_listing_strategy_config() -> NewListingStrategyConfig:
             for req in _DEFAULT_REQUIREMENTS
         ),
         max_new_positions=3,
+        max_min_margin_share=0.25,
         exclude_symbols=(),
         atr_period=12,
         atr_skip_pct=0.075,

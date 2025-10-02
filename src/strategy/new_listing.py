@@ -110,6 +110,7 @@ class NewListingTradingStrategy:
         self._load_persisted_exclusions()
         if self._static_exclusions:
             logger.info("Static exclusions configured: %s", ", ".join(sorted(self._static_exclusions)))
+        self._last_wallet_equity: float = 0.0
         analytics_root = Path(__file__).resolve().parents[2] / "analytics"
         analytics_root.mkdir(parents=True, exist_ok=True)
         history_file = analytics_root / "trade_history.jsonl"
@@ -155,6 +156,14 @@ class NewListingTradingStrategy:
         positions = self._safe_refresh_positions()
         self._update_analytics_after_refresh(positions)
         wallet_snapshot = self._wallet_manager.fetch_once()
+        if wallet_snapshot is None:
+            logger.warning("Wallet snapshot unavailable; aborting run")
+            return
+        self._last_wallet_equity = getattr(
+            wallet_snapshot,
+            "total_equity",
+            wallet_snapshot.available_balance,
+        )
         available = wallet_snapshot.available_balance
         if available <= 0:
             logger.info(
@@ -1388,6 +1397,21 @@ class NewListingTradingStrategy:
                 min_margin_required,
             )
             return None
+        share_limit = getattr(self._config, "max_min_margin_share", 0.0)
+        equity_baseline = getattr(self, "_last_wallet_equity", 0.0)
+        if equity_baseline <= 0:
+            equity_baseline = available_margin
+        if share_limit > 0 and equity_baseline > 0:
+            max_allowed_margin = equity_baseline * share_limit
+            if min_margin_required > max_allowed_margin:
+                logger.info(
+                    "Skipping %s because minimum margin %.6f exceeds %.2f%% of total equity %.6f",
+                    symbol,
+                    min_margin_required,
+                    share_limit * 100.0,
+                    equity_baseline,
+                )
+                return None
         budget_margin = max(margin_cap, min_margin_required)
         if budget_margin > available_margin:
             budget_margin = available_margin
