@@ -32,6 +32,9 @@ logger = logging.getLogger("smpStrategy.strategy.new_listing")
 
 _EXCLUSION_FILE_NAME = "newListingStrategy.exclusions.json"
 
+_STALE_POSITION_MAX_AGE = timedelta(hours=1)
+_TUNER_INACTIVITY_THRESHOLD = timedelta(hours=1)
+
 
 @dataclass(slots=True)
 class Candle:
@@ -106,11 +109,18 @@ class NewListingTradingStrategy:
         self._static_exclusions: set[str] = {sym.upper() for sym in self._config.exclude_symbols}
         self._dynamic_exclusions: set[str] = set()
         self._excluded_symbols: set[str] = set(self._static_exclusions)
+        self._loss_streak: dict[str, int] = {}
+        self._loss_pnl: dict[str, float] = {}
         self._exclusion_file = self._resolve_exclusion_file()
         self._load_persisted_exclusions()
         if self._static_exclusions:
             logger.info("Static exclusions configured: %s", ", ".join(sorted(self._static_exclusions)))
         self._last_wallet_equity: float = 0.0
+        self._stale_force_close: set[str] = set()
+        now = datetime.now(timezone.utc)
+        self._last_trade_time: datetime = now
+        self._last_tuner_force: datetime = now
+        self._last_performance_snapshot: Optional[dict[str, dict[str, Any]]] = None
         analytics_root = Path(__file__).resolve().parents[2] / "analytics"
         analytics_root.mkdir(parents=True, exist_ok=True)
         history_file = analytics_root / "trade_history.jsonl"
@@ -137,10 +147,10 @@ class NewListingTradingStrategy:
                 log_file=tuning_log_file,
                 model_dir=optimizer_root,
                 optimized_config_path=optimized_config_path,
-                evaluation_trades=20,
-                evaluation_duration=timedelta(hours=2),
-                candidate_trade_interval=20,
-                candidate_time_interval=timedelta(hours=2),
+                evaluation_trades=60,
+                evaluation_duration=timedelta(hours=6),
+                candidate_trade_interval=45,
+                candidate_time_interval=timedelta(hours=4),
             )
         else:
             self._parameter_manager = None
@@ -170,6 +180,8 @@ class NewListingTradingStrategy:
                 "Available balance is non-positive; wallet_available=%s", available
             )
             return
+        self._close_stale_positions(positions)
+        self._maybe_force_parameter_tuner(datetime.now(timezone.utc))
         self._timeframe_cache = {}
         if initial_candidates is not None:
             symbols = [sym.upper() for sym in initial_candidates]
@@ -603,6 +615,7 @@ class NewListingTradingStrategy:
                 "notional": notional,
                 "margin_required": margin_required,
                 "order_id": order_id,
+                "entry_timestamp": snapshot.updated_at.isoformat(),
                 "allocation_pct": decision_context.get("allocation_pct", self._config.allocation_pct),
                 "atr_skip_pct": decision_context.get("atr_skip_pct", self._config.atr_skip_pct),
                 "ema_period": decision_context.get("ema_period", self._config.ema_period),
@@ -611,6 +624,9 @@ class NewListingTradingStrategy:
                 "weight_30m": decision_context.get("weight_30m", self._config.weight_30m),
                 "fallback_threshold_pct": decision_context.get(
                     "fallback_threshold_pct", self._config.fallback_threshold_pct
+                ),
+                "min_notional_buffer_pct": decision_context.get(
+                    "min_notional_buffer_pct", self._config.min_notional_buffer_pct
                 ),
                 "trend_filter_min_ema": decision_context.get(
                     "trend_filter_min_ema", self._config.trend_filter_min_ema
@@ -692,11 +708,99 @@ class NewListingTradingStrategy:
                 snapshot = self._performance_tracker.record(closed_records)
             except Exception as exc:  # noqa: BLE001
                 logger.debug("Performance tracker update failed: %s", exc)
+            self._last_trade_time = datetime.now(timezone.utc)
+            if snapshot is not None:
+                self._last_performance_snapshot = snapshot
+        elif snapshot is not None:
+            self._last_performance_snapshot = snapshot
         if self._parameter_manager:
             try:
                 self._parameter_manager.process_trades(closed_records, snapshot)
             except Exception as exc:  # noqa: BLE001
                 logger.debug("Parameter manager processing failed: %s", exc)
+        if closed_records and getattr(self._config, "dynamic_exclusion_enabled", False):
+            loss_limit = max(1, getattr(self._config, "dynamic_exclusion_consecutive_losses", 1))
+            for record in closed_records:
+                symbol = record.symbol.upper()
+                pnl = float(record.realized_pnl)
+                if pnl <= 0:
+                    self._loss_streak[symbol] = self._loss_streak.get(symbol, 0) + 1
+                    self._loss_pnl[symbol] = self._loss_pnl.get(symbol, 0.0) + pnl
+                    if self._loss_streak[symbol] >= loss_limit:
+                        reason = (
+                            f"{self._loss_streak[symbol]} consecutive losses "
+                            f"({self._loss_pnl[symbol]:.4f} USDT)"
+                        )
+                        self._exclude_symbol(symbol, reason)
+                        self._loss_streak.pop(symbol, None)
+                        self._loss_pnl.pop(symbol, None)
+                else:
+                    self._loss_streak.pop(symbol, None)
+                    self._loss_pnl.pop(symbol, None)
+        if hasattr(self, "_stale_force_close"):
+            for record in closed_records:
+                self._stale_force_close.discard(record.symbol)
+            open_set = {sym.upper() for sym in positions.keys()}
+            self._stale_force_close.intersection_update(open_set)
+
+    def _maybe_force_parameter_tuner(self, now: datetime) -> None:
+        if not self._parameter_manager:
+            return
+        reference = max(self._last_trade_time, self._last_tuner_force)
+        if now - reference < _TUNER_INACTIVITY_THRESHOLD:
+            return
+        snapshot = self._last_performance_snapshot
+        if self._parameter_manager.force_new_experiment(snapshot):
+            idle_minutes = (now - self._last_trade_time).total_seconds() / 60.0
+            logger.info(
+                "Parameter tuner force-started new experiment after %.2f minutes without trades",
+                idle_minutes,
+            )
+            self._last_tuner_force = now
+
+    def _close_stale_positions(
+        self,
+        positions: dict[str, PositionSnapshot],
+    ) -> None:
+        if not hasattr(self, "_trade_ledger"):
+            return
+        try:
+            open_entries = self._trade_ledger.open_entries()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Unable to inspect open ledger entries: %s", exc)
+            return
+        if not open_entries:
+            return
+        now = datetime.now(timezone.utc)
+        cutoff = now - _STALE_POSITION_MAX_AGE
+        for symbol, entry in open_entries.items():
+            opened_at = getattr(entry, "opened_at", None)
+            if opened_at is None or opened_at > cutoff:
+                continue
+            snapshot = positions.get(symbol)
+            if snapshot is None or abs(snapshot.size) <= 0:
+                continue
+            if symbol in self._stale_force_close:
+                continue
+            qty = abs(snapshot.size)
+            close_side = "Sell" if snapshot.side.lower() == "buy" else "Buy"
+            try:
+                self._client.close_position_market(
+                    symbol=symbol,
+                    side=close_side,
+                    qty=qty,
+                    category=self._category,
+                )
+                age_minutes = (now - opened_at).total_seconds() / 60.0
+                logger.info(
+                    "Force-closing %s held for %.2f minutes (limit %.2f)",
+                    symbol,
+                    age_minutes,
+                    _STALE_POSITION_MAX_AGE.total_seconds() / 60.0,
+                )
+                self._stale_force_close.add(symbol)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to force-close stale position %s: %s", symbol, exc)
 
     # ----- Symbol evaluation -----
     def _fetch_candidate_symbols(self) -> list[str]:
@@ -756,6 +860,15 @@ class NewListingTradingStrategy:
         if not trend_passed:
             return _skip("trend_filter_rejected", {"trend_filter": trend_metrics})
         decision_details["candles"] = {tf: len(frames.get(tf, [])) for tf in ("5m", "15m", "30m")}
+        selection_info: dict[str, Any] = {
+            "available_30m": timeframe_result.metrics.get("available_30m_bars"),
+        }
+        if "selection_volatility_pct" in timeframe_result.metrics:
+            selection_info["volatility_pct"] = round(
+                timeframe_result.metrics["selection_volatility_pct"],
+                6,
+            )
+        decision_details["selection"] = selection_info
         decision_details["trend_filter"] = trend_metrics
         candles_5m = frames.get("5m", [])
         atr_ratio = timeframe_result.metrics.get("atr_ratio")
@@ -815,6 +928,7 @@ class NewListingTradingStrategy:
             "atr_ratio": atr_ratio,
             "requirement": timeframe_result.requirement.name,
             "candles": decision_details.get("candles", {}),
+            "selection": selection_info,
             "allocation_pct": self._config.allocation_pct,
             "atr_skip_pct": self._config.atr_skip_pct,
             "ema_period": self._config.ema_period,
@@ -841,6 +955,8 @@ class NewListingTradingStrategy:
             "score_atr_weight": self._config.score_atr_weight,
             "score_reversal_penalty": self._config.score_reversal_penalty,
             "score_atr_ceiling": self._config.score_atr_ceiling,
+            "decision_timestamp": decision_details.get("timestamp"),
+            "min_notional_buffer_pct": self._config.min_notional_buffer_pct,
         }
         entry = self._attempt_entry(
             symbol,
@@ -875,38 +991,62 @@ class NewListingTradingStrategy:
         requirements = self._config.requirements
         max_required_30 = max(req.min_30m for req in requirements)
         base_limit_30 = max(max_required_30, self._config.ema_period + 2)
-        candles_30 = self._fetch_candles(symbol, "30", base_limit_30)
-        if not candles_30:
+        candles_30_all = self._fetch_candles(symbol, "30", base_limit_30)
+        if not candles_30_all:
             logger.debug("No 30m candles retrieved for %s", symbol)
             return None
-        available_30 = len(candles_30)
-        requirement = self._select_requirement(available_30, requirements)
+        available_30 = len(candles_30_all)
+        ema_window_requirement = self._config.ema_period + self._config.trend_slope_window
+        max_required_5 = max(req.min_5m for req in requirements)
+        base_limit_5 = max(
+            max_required_5,
+            self._config.min_5m_bars,
+            ema_window_requirement,
+            self._config.atr_period + 2,
+            self._config.trend_filter_range_lookback + 1,
+        )
+        candles_5_all = self._fetch_candles(symbol, "5", base_limit_5)
+        volatility_pct: Optional[float] = None
+        if candles_5_all:
+            lookback = min(len(candles_5_all), max(2, self._config.trend_filter_range_lookback))
+            if lookback > 0:
+                window = candles_5_all[-lookback:]
+                high = max(c.high for c in window)
+                low = min(c.low for c in window)
+                last_close = window[-1].close if window else 0.0
+                if last_close > 0:
+                    volatility_pct = (high - low) / last_close
+        requirement = self._select_requirement(available_30, volatility_pct, requirements)
         if requirement is None:
             logger.debug(
-                "No matching requirement block for %s (available_30=%s)",
+                "No matching requirement block for %s (available_30=%s volatility=%.6f)",
                 symbol,
                 available_30,
+                volatility_pct or 0.0,
             )
             return None
         logger.debug(
-            "Requirement '%s' selected for %s (available_30=%s)",
+            "Requirement '%s' selected for %s (available_30=%s volatility=%.6f)",
             requirement.name,
             symbol,
             available_30,
+            volatility_pct or 0.0,
         )
-        ema_window_requirement = self._config.ema_period + self._config.trend_slope_window
-        candles_30 = candles_30[-max(requirement.min_30m, ema_window_requirement) :]
+        metrics: dict[str, Any] = {}
+        if volatility_pct is not None:
+            metrics["selection_volatility_pct"] = volatility_pct
+        metrics["available_30m_bars"] = available_30
+        candles_30 = candles_30_all[-max(requirement.min_30m, ema_window_requirement) :]
         candles_15 = self._fetch_candles(
             symbol,
             "15",
             max(requirement.min_15m, ema_window_requirement),
         )
         min_5m_required = max(requirement.min_5m, self._config.min_5m_bars)
-        candles_5 = self._fetch_candles(
-            symbol,
-            "5",
-            max(min_5m_required, ema_window_requirement),
-        )
+        if candles_5_all:
+            candles_5 = candles_5_all[-max(min_5m_required, ema_window_requirement) :]
+        else:
+            candles_5 = []
         if len(candles_30) < requirement.min_30m or len(candles_15) < requirement.min_15m:
             logger.debug(
                 "Insufficient 15m/30m data for %s (15m=%s 30m=%s)",
@@ -914,7 +1054,7 @@ class NewListingTradingStrategy:
                 len(candles_15),
                 len(candles_30),
             )
-            return TimeframeDataResult(requirement=requirement, frames={})
+            return TimeframeDataResult(requirement=requirement, frames={}, metrics=metrics)
         if len(candles_5) < min_5m_required:
             logger.debug(
                 "Insufficient 5m data for %s (required=%s got=%s)",
@@ -922,13 +1062,13 @@ class NewListingTradingStrategy:
                 min_5m_required,
                 len(candles_5),
             )
-            return TimeframeDataResult(requirement=requirement, frames={})
+            return TimeframeDataResult(requirement=requirement, frames={}, metrics=metrics)
         frames = {
             "5m": candles_5,
             "15m": candles_15,
             "30m": candles_30,
         }
-        return TimeframeDataResult(requirement=requirement, frames=frames)
+        return TimeframeDataResult(requirement=requirement, frames=frames, metrics=metrics)
 
     def _passes_trend_filter(
         self,
@@ -1079,6 +1219,7 @@ class NewListingTradingStrategy:
     def _select_requirement(
         self,
         available_30: int,
+        volatility_pct: Optional[float],
         requirements: Iterable[TimeframeRequirement],
     ) -> Optional[TimeframeRequirement]:
         for req in requirements:
@@ -1086,6 +1227,11 @@ class NewListingTradingStrategy:
                 continue
             if req.max_available_30m is not None and available_30 > req.max_available_30m:
                 continue
+            if volatility_pct is not None:
+                if req.min_volatility_pct is not None and volatility_pct < req.min_volatility_pct:
+                    continue
+                if req.max_volatility_pct is not None and volatility_pct > req.max_volatility_pct:
+                    continue
             return req
         return None
 
@@ -1197,10 +1343,10 @@ class NewListingTradingStrategy:
         return fallback_trend, meta
 
     def _compute_ema_scores(self, timeframe_data: dict[str, list[Candle]]) -> dict[str, float]:
-        period = self._config.ema_period
+        period = int(round(self._config.ema_period))
         if period < 2:
             raise ValueError("EMA period must be >= 2")
-        window = max(1, self._config.trend_slope_window)
+        window = max(1, int(round(self._config.trend_slope_window)))
         scores: dict[str, float] = {}
         for tf in ("5m", "15m", "30m"):
             candles = timeframe_data.get(tf)
@@ -1388,7 +1534,12 @@ class NewListingTradingStrategy:
             return None
         available_margin = max(0.0, available)
         max_affordable_notional = available_margin * leverage
-        min_margin_required = min_notional / leverage if leverage > 0 else min_notional
+        buffer_multiplier = 1.0 + max(0.0, getattr(self._config, "min_notional_buffer_pct", 0.0))
+        buffered_notional = min_notional * buffer_multiplier if min_notional > 0 else min_notional
+        target_min_notional = min_notional
+        if buffered_notional > min_notional and buffered_notional <= max_affordable_notional + 1e-8:
+            target_min_notional = buffered_notional
+        min_margin_required = target_min_notional / leverage if leverage > 0 else target_min_notional
         if available_margin < min_margin_required:
             logger.info(
                 "Skipping %s because available margin %.6f is below minimum required %.6f",
@@ -1463,6 +1614,35 @@ class NewListingTradingStrategy:
                 symbol,
             )
             return None
+        if target_min_notional > min_notional and notional + 1e-9 < target_min_notional:
+            required_qty = target_min_notional / last_close if last_close > 0 else qty
+            if qty_step > 0:
+                min_steps = math.ceil(min_qty / qty_step) if qty_step > 0 else 1
+                required_steps = max(math.ceil(required_qty / qty_step), min_steps)
+                required_qty = required_steps * qty_step
+            else:
+                required_qty = max(required_qty, min_qty)
+            if max_qty and max_qty > 0:
+                required_qty = min(required_qty, max_qty)
+            adjusted_notional = required_qty * last_close
+            if adjusted_notional < min_notional - 1e-9:
+                logger.debug(
+                    "Unable to raise quantity for %s to satisfy minimum order value (adjusted_notional=%.6f min=%.6f)",
+                    symbol,
+                    adjusted_notional,
+                    min_notional,
+                )
+                return None
+            if adjusted_notional > max_affordable_notional + 1e-8:
+                logger.debug(
+                    "Buffered notional %.6f exceeds affordable %.6f for %s",
+                    adjusted_notional,
+                    max_affordable_notional,
+                    symbol,
+                )
+                return None
+            qty = required_qty
+            notional = adjusted_notional
         margin_required = notional / leverage
         if margin_required > available_margin + 1e-8:
             logger.debug(

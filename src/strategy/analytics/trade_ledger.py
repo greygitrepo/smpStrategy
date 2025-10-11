@@ -5,9 +5,10 @@ from __future__ import annotations
 import json
 import logging
 import threading
+from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 from src.data.symbol.snapshots import PositionSnapshot
 from src.exchange.bybit_v5 import BybitAPIError, BybitV5Client
@@ -119,6 +120,10 @@ class TradeLedger:
                 context=context or {},
             )
 
+    def open_entries(self) -> Dict[str, LedgerEntry]:
+        with self._lock:
+            return deepcopy(self._open)
+
     def sync(self, positions: Dict[str, PositionSnapshot]) -> List[TradeRecord]:
         """Detect closed symbols by diffing active positions and persist realized trades."""
         closed: List[TradeRecord] = []
@@ -187,30 +192,65 @@ class TradeLedger:
             )
             return None
         records = response.get("result", {}).get("list") or []
-        for item in sorted(records, key=lambda it: _parse_timestamp(it.get("updatedTime")).timestamp(), reverse=True):
+        def _safe_timestamp(value: Any) -> datetime:
+            parsed = _parse_timestamp(value)
+            if parsed is None:
+                return datetime.now(timezone.utc)
+            return parsed
+
+        for item in sorted(records, key=lambda it: _safe_timestamp(it.get("updatedTime")).timestamp(), reverse=True):
             close_id = str(item.get("execId") or item.get("orderId") or item.get("id") or item.get("tradeId") or "")
             if close_id and close_id in self._seen_close_ids:
                 continue
-            closed_at = _parse_timestamp(item.get("updatedTime") or item.get("createdTime"))
+            closed_at = _safe_timestamp(
+                item.get("updatedTime")
+                or item.get("updateTime")
+                or item.get("closedTime")
+                or item.get("closeTime")
+                or item.get("timestamp")
+            )
+            raw_entry_price = item.get("avgEntryPrice") or item.get("avgPrice") or item.get("entryPrice") or item.get("price")
+            try:
+                entry_price = float(raw_entry_price)
+            except (TypeError, ValueError):
+                entry_price = entry.entry_price
             exit_price = float(item.get("avgExitPrice") or item.get("avgPrice") or item.get("lastPrice") or item.get("price") or 0.0)
             pnl = float(item.get("closedPnl") or item.get("realisedPnl") or item.get("pnl") or 0.0)
-            qty = float(item.get("qty") or entry.size)
+            qty = float(item.get("qty") or item.get("closedSize") or entry.size)
             metadata = {
                 "context": entry.context,
                 "raw": item,
             }
-            holding_seconds = max(0.0, (closed_at - entry.opened_at).total_seconds())
-            notional = entry.notional if entry.notional else abs(entry.entry_price * qty)
+            created_time = (
+                item.get("createdTime")
+                or item.get("createTime")
+                or item.get("openTime")
+                or item.get("startTime")
+            )
+            opened_at = _safe_timestamp(created_time) if created_time else entry.opened_at
+            if opened_at > closed_at and isinstance(entry.context, dict):
+                for key in ("entry_timestamp", "decision_timestamp"):
+                    ctx_value = entry.context.get(key)
+                    if not ctx_value:
+                        continue
+                    ctx_parsed = _safe_timestamp(ctx_value)
+                    if ctx_parsed <= closed_at:
+                        opened_at = ctx_parsed
+                        break
+                else:
+                    opened_at = entry.opened_at
+            holding_seconds = max(0.0, (closed_at - opened_at).total_seconds())
+            notional = entry.notional if entry.notional else abs(entry_price * qty)
             return_pct = pnl / notional if notional else None
             record = TradeRecord(
                 symbol=entry.symbol,
-                side=item.get("side") or entry.side,
+                side=entry.side,
                 size=qty,
-                entry_price=entry.entry_price,
+                entry_price=entry_price,
                 exit_price=exit_price,
                 realized_pnl=pnl,
                 notional=notional,
-                opened_at=entry.opened_at,
+                opened_at=opened_at,
                 closed_at=closed_at,
                 holding_seconds=holding_seconds,
                 order_id=entry.order_id,

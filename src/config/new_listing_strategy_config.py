@@ -25,6 +25,8 @@ class TimeframeRequirement:
     min_5m: int
     min_15m: int
     min_30m: int
+    min_volatility_pct: Optional[float] = None
+    max_volatility_pct: Optional[float] = None
 
 
 @dataclass(slots=True)
@@ -45,6 +47,9 @@ class NewListingStrategyConfig:
     min_5m_bars: int = 20
     max_new_positions: int = 3
     max_min_margin_share: float = 0.25
+    min_notional_buffer_pct: float = 0.02
+    dynamic_exclusion_enabled: bool = True
+    dynamic_exclusion_consecutive_losses: int = 3
     requirements: tuple[TimeframeRequirement, ...] = ()
     exclude_symbols: tuple[str, ...] = ()
     atr_period: int = 14
@@ -128,6 +133,15 @@ def _parse_requirement(section_name: str, section: configparser.SectionProxy) ->
     max_available = int(max_available_raw) if max_available_raw else None
     if max_available is not None and max_available <= 0:
         max_available = None
+    def _parse_volatility(key: str) -> Optional[float]:
+        raw = section.get(key, fallback="").strip()
+        if not raw:
+            return None
+        try:
+            value = float(raw)
+        except ValueError:
+            return None
+        return max(0.0, _normalize_percent(value, assume_percent=True))
     return TimeframeRequirement(
         name=section.get("name", fallback=section_name.split(".")[-1]),
         min_available_30m=min_available,
@@ -135,6 +149,8 @@ def _parse_requirement(section_name: str, section: configparser.SectionProxy) ->
         min_5m=max(1, section.getint("min_5m", fallback=10)),
         min_15m=max(1, section.getint("min_15m", fallback=10)),
         min_30m=max(1, section.getint("min_30m", fallback=min_available or 1)),
+        min_volatility_pct=_parse_volatility("min_volatility_pct"),
+        max_volatility_pct=_parse_volatility("max_volatility_pct"),
     )
 
 
@@ -195,6 +211,13 @@ def load_new_listing_strategy_config(
             ),
         ),
     )
+    min_notional_buffer_pct = max(
+        0.0,
+        _normalize_percent(
+            base.getfloat("min_notional_buffer_pct", fallback=2.0),
+            assume_percent=True,
+        ),
+    )
     fallback_threshold_pct = max(
         0.0,
         _normalize_percent(
@@ -246,6 +269,10 @@ def load_new_listing_strategy_config(
     )
     min_5m_bars = max(1, base.getint("min_5m_bars", fallback=20))
     max_new_positions = max(1, base.getint("max_new_positions", fallback=3))
+    dynamic_exclusion_enabled = base.getboolean("dynamic_exclusion_enabled", fallback=True)
+    dynamic_exclusion_consecutive_losses = max(
+        1, base.getint("dynamic_exclusion_consecutive_losses", fallback=3)
+    )
     tuning_min_total_trades = max(1, base.getint("tuning_min_total_trades", fallback=30))
     tuning_min_gap_trades = max(1, base.getint("tuning_min_gap_trades", fallback=15))
     trend_filter_min_ema = max(
@@ -326,10 +353,13 @@ def load_new_listing_strategy_config(
         leverage=leverage,
         allocation_pct=allocation_pct,
         max_min_margin_share=max_min_margin_share,
+        min_notional_buffer_pct=min_notional_buffer_pct,
         tp_pct=tp_pct,
         sl_pct=sl_pct,
         min_5m_bars=min_5m_bars,
         max_new_positions=max_new_positions,
+        dynamic_exclusion_enabled=dynamic_exclusion_enabled,
+        dynamic_exclusion_consecutive_losses=dynamic_exclusion_consecutive_losses,
         requirements=requirements,
         exclude_symbols=exclude_symbols,
         atr_period=atr_period,
@@ -411,10 +441,13 @@ def write_new_listing_strategy_config(
         "fallback_threshold_pct": _format_percent(config.fallback_threshold_pct),
         "allocation_pct": _format_percent(config.allocation_pct),
         "max_min_margin_share": _format_percent(config.max_min_margin_share),
+        "min_notional_buffer_pct": _format_percent(config.min_notional_buffer_pct),
         "tp_pct": _format_percent(max(MIN_TP_PCT, config.tp_pct)),
         "sl_pct": _format_percent(config.sl_pct),
         "min_5m_bars": str(config.min_5m_bars),
         "max_new_positions": str(config.max_new_positions),
+        "dynamic_exclusion_enabled": "true" if config.dynamic_exclusion_enabled else "false",
+        "dynamic_exclusion_consecutive_losses": str(config.dynamic_exclusion_consecutive_losses),
         "atr_period": str(config.atr_period),
         "atr_skip_pct": _format_percent(config.atr_skip_pct),
         "atr_sl_multiplier": _format_float(config.atr_sl_multiplier),
@@ -459,6 +492,14 @@ def write_new_listing_strategy_config(
             "min_15m": str(requirement.min_15m),
             "min_30m": str(requirement.min_30m),
         }
+        if requirement.min_volatility_pct is not None:
+            parser[req_section_name]["min_volatility_pct"] = _format_percent(requirement.min_volatility_pct)
+        else:
+            parser[req_section_name]["min_volatility_pct"] = ""
+        if requirement.max_volatility_pct is not None:
+            parser[req_section_name]["max_volatility_pct"] = _format_percent(requirement.max_volatility_pct)
+        else:
+            parser[req_section_name]["max_volatility_pct"] = ""
 
     output_path = Path(path).expanduser()
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -486,6 +527,9 @@ def default_new_listing_strategy_config() -> NewListingStrategyConfig:
         ),
         max_new_positions=3,
         max_min_margin_share=0.25,
+        min_notional_buffer_pct=0.02,
+        dynamic_exclusion_enabled=True,
+        dynamic_exclusion_consecutive_losses=3,
         exclude_symbols=(),
         atr_period=12,
         atr_skip_pct=0.075,

@@ -77,6 +77,13 @@ class AdaptiveParameterManager:
     """Online-learning driven parameter tuner with experiment/rollback flow."""
 
     _FEATURE_ALPHA = 0.05
+    _MIN_SUCCESS_WIN_RATE = 0.60
+    _PARAM_UPPER_BOUNDS: Dict[str, float] = {
+        "trend_filter_min_ema": 0.009,          # 0.9%
+        "trend_filter_min_atr": 0.02,          # 2%
+        "trend_filter_min_range_pct": 0.012,   # 1.2%
+        "fallback_threshold_pct": 0.05,        # 5%
+    }
 
     def __init__(
         self,
@@ -111,6 +118,7 @@ class AdaptiveParameterManager:
         self._experiment: Optional[ExperimentState] = None
         self._param_specs = self._build_param_specs()
         self._load_model_state()
+        self._enforce_config_limits()
         self._persist_config()
 
     def process_trades(
@@ -149,6 +157,9 @@ class AdaptiveParameterManager:
         features["weight_30m"] = float(context.get("weight_30m", self._config.weight_30m))
         features["fallback_threshold_pct"] = float(
             context.get("fallback_threshold_pct", self._config.fallback_threshold_pct)
+        )
+        features["min_notional_buffer_pct"] = float(
+            context.get("min_notional_buffer_pct", getattr(self._config, "min_notional_buffer_pct", 0.0))
         )
         features["trend_filter_min_ema"] = float(
             context.get("trend_filter_min_ema", self._config.trend_filter_min_ema)
@@ -280,6 +291,7 @@ class AdaptiveParameterManager:
         best_score = baseline_score
         for _ in range(16):
             candidate = self._sample_candidate()
+            candidate = self._clamp_parameters(candidate)
             features = self._project_features(candidate)
             score = self._model.predict(features)
             if score > best_score + 1e-9:
@@ -327,6 +339,7 @@ class AdaptiveParameterManager:
         snapshot: Optional[dict[str, dict[str, Any]]],
         now: datetime,
     ) -> None:
+        candidate = self._clamp_parameters(candidate)
         baseline_values = {name: getattr(self._config, name) for name in candidate}
         window_metrics = (snapshot or {}).get("window", {})
         baseline_trades = int(window_metrics.get("trades", 0)) or 1
@@ -362,6 +375,11 @@ class AdaptiveParameterManager:
         avg = pnl / max(1, len(trades))
         baseline_avg = self._experiment.baseline_avg_pnl
         success = avg >= baseline_avg
+        window_snapshot = snapshot.get("window", {}) if snapshot else {}
+        win_rate = float(window_snapshot.get("win_rate", 0.0) or 0.0)
+        window_trades = int(window_snapshot.get("trades", 0) or 0)
+        if window_trades > 0 and win_rate < self._MIN_SUCCESS_WIN_RATE:
+            success = False
         result = "accepted" if success else "rolled_back"
         if not success:
             for name, value in self._experiment.baseline_values.items():
@@ -376,6 +394,7 @@ class AdaptiveParameterManager:
                 "baseline_avg_pnl": baseline_avg,
                 "trades": len(trades),
                 "pnl": pnl,
+                "win_rate": win_rate,
                 "ended_at": now.isoformat(),
             },
         )
@@ -417,6 +436,59 @@ class AdaptiveParameterManager:
         else:
             logger.debug("Suggested parameters with predicted score %.6f (baseline %.6f)", best_score, baseline_score)
         return best_candidate
+
+    def force_new_experiment(
+        self,
+        snapshot: Optional[dict[str, dict[str, Any]]] = None,
+    ) -> bool:
+        """Start a new candidate experiment immediately, bypassing idle thresholds."""
+
+        now = datetime.now(timezone.utc)
+        if self._total_trades == 0:
+            logger.debug("Cannot force tuner experiment: no trade history yet")
+            return False
+        if self._experiment is not None:
+            logger.info("Forcing parameter tuner to abort current experiment and restart")
+            for name, value in self._experiment.baseline_values.items():
+                setattr(self._config, name, value)
+            self._persist_config()
+            self._log_event(
+                "experiment_force_abort",
+                {
+                    "candidate": self._experiment.candidate,
+                    "baseline": self._experiment.baseline_values,
+                    "start_time": self._experiment.start_time.isoformat(),
+                    "forced_at": now.isoformat(),
+                },
+            )
+            self._experiment = None
+            self._trades_since_update = 0
+        candidate = self._select_candidate()
+        if candidate is None:
+            logger.debug("Force tuner experiment requested but no improved candidate available")
+            return False
+        self._start_experiment(candidate, snapshot, now)
+        logger.info("Parameter tuner force-started experiment after inactivity")
+        return True
+
+    def _clamp_parameters(self, candidate: Dict[str, float]) -> Dict[str, float]:
+        for name, upper in self._PARAM_UPPER_BOUNDS.items():
+            if name in candidate:
+                if candidate[name] > upper:
+                    candidate[name] = upper
+        return candidate
+
+    def _enforce_config_limits(self) -> None:
+        updated = False
+        for name, upper in self._PARAM_UPPER_BOUNDS.items():
+            current = getattr(self._config, name, None)
+            if current is None:
+                continue
+            if current > upper:
+                setattr(self._config, name, upper)
+                updated = True
+        if updated:
+            logger.debug("Clamped configuration values to safety bounds")
 
     def _log_event(self, event: str, payload: Dict[str, Any]) -> None:
         record = {"event": event, "timestamp": datetime.now(timezone.utc).isoformat(), **payload}

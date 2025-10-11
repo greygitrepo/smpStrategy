@@ -96,6 +96,37 @@ class ActivePositionTracker:
             except (TypeError, ValueError):
                 return 0.0
 
+        def _parse_timestamp(value: Any) -> datetime | None:
+            if value is None:
+                return None
+            try:
+                if isinstance(value, str):
+                    cleaned = value.strip()
+                    if not cleaned:
+                        return None
+                    if cleaned.isdigit():
+                        value = int(cleaned)
+                    else:
+                        if cleaned.endswith("Z"):
+                            cleaned = cleaned[:-1] + "+00:00"
+                        return datetime.fromisoformat(cleaned)
+                if isinstance(value, (int, float)):
+                    # Bybit millisecond epoch support
+                    if value > 1_000_000_000_000:
+                        value /= 1000.0
+                    return datetime.fromtimestamp(float(value), tz=timezone.utc)
+            except Exception:
+                return None
+            return None
+
+        timestamp = datetime.now(timezone.utc)
+        for key in ("updatedTime", "updateTime", "timestamp", "createdTime", "openTime"):
+            candidate = data.get(key)
+            parsed = _parse_timestamp(candidate)
+            if parsed is not None:
+                timestamp = parsed
+                break
+
         return PositionSnapshot(
             symbol=(data.get("symbol") or "").upper(),
             size=_to_float(data.get("size")),
@@ -103,6 +134,6 @@ class ActivePositionTracker:
             entry_price=_to_float(data.get("avgPrice")),
             leverage=_to_float(data.get("leverage")),
             unrealized_pnl=_to_float(data.get("unrealisedPnl")),
-            updated_at=datetime.now(timezone.utc),
+            updated_at=timestamp,
             raw=data,
         )
