@@ -1,0 +1,5 @@
+# Core HTTP client for Bybit REST interactions
+httpx>=0.27
+
+# Optional: enable private WebSocket client support
+websocket-client>=1.7
