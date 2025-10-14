@@ -31,11 +31,6 @@ echo "✅ Bot 실행됨. PID: $(cat "$PID_FILE")"
 echo "📄 로그: $LOG_DIR/bot.log"
 
 start_telegram_bot () {
-  if [ -z "${TELEGRAM_BOT_TOKEN:-}" ]; then
-    echo "⚠️ TELEGRAM_BOT_TOKEN이 설정되지 않아 Telegram bot을 시작하지 않습니다."
-    return
-  fi
-
   if [ -f "$TELEGRAM_PID_FILE" ] && ps -p "$(cat "$TELEGRAM_PID_FILE")" > /dev/null 2>&1; then
     echo "ℹ️ Telegram bot이 이미 실행 중입니다. PID: $(cat "$TELEGRAM_PID_FILE")"
     return
