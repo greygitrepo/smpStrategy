@@ -525,7 +525,7 @@ def default_new_listing_strategy_config() -> NewListingStrategyConfig:
             )
             for req in _DEFAULT_REQUIREMENTS
         ),
-        max_new_positions=3,
+        max_new_positions=5,
         max_min_margin_share=0.25,
         min_notional_buffer_pct=0.02,
         dynamic_exclusion_enabled=True,
