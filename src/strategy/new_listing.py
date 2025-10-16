@@ -1149,7 +1149,10 @@ class NewListingTradingStrategy:
                 self._config.trend_filter_min_range_pct,
             )
             return False
-        reversals = self._count_trend_reversals([c.close for c in window])
+        reversals = self._count_trend_reversals(
+            [c.close for c in window],
+            threshold_pct=self._config.trend_reverse_candle_threshold_pct,
+        )
         timeframe_result.metrics["reversals"] = reversals
         if reversals > self._config.trend_filter_max_reversals:
             logger.debug(
@@ -1205,12 +1208,20 @@ class NewListingTradingStrategy:
         return atr / price
 
     @staticmethod
-    def _count_trend_reversals(closes: list[float]) -> int:
+    def _count_trend_reversals(closes: list[float], *, threshold_pct: float = 0.0) -> int:
+        threshold = max(0.0, threshold_pct)
         reversals = 0
         last_sign = 0
         for idx in range(1, len(closes)):
-            diff = closes[idx] - closes[idx - 1]
+            current = closes[idx]
+            previous = closes[idx - 1]
+            diff = current - previous
             if diff == 0:
+                continue
+            magnitude = abs(diff)
+            if previous > 0:
+                magnitude = abs(diff / previous)
+            if threshold > 0.0 and magnitude < threshold:
                 continue
             sign = 1 if diff > 0 else -1
             if last_sign and sign != last_sign:
