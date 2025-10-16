@@ -13,6 +13,7 @@ _DEFAULT_FILE_NAME = "newListingStrategy.ini"
 _CONFIG_DIR = Path(__file__).resolve().parents[2] / "config"
 
 MIN_TP_PCT = 0.012  # enforce 1.2% floor for take-profit percentage
+MIN_TREND_FILTER_MIN_EMA = 0.0048  # prevent trend filter EMA threshold from getting too weak
 
 
 @dataclass(slots=True)
@@ -50,6 +51,7 @@ class NewListingStrategyConfig:
     min_notional_buffer_pct: float = 0.02
     dynamic_exclusion_enabled: bool = True
     dynamic_exclusion_consecutive_losses: int = 3
+    preferred_requirement_name: Optional[str] = None
     requirements: tuple[TimeframeRequirement, ...] = ()
     exclude_symbols: tuple[str, ...] = ()
     atr_period: int = 14
@@ -66,6 +68,7 @@ class NewListingStrategyConfig:
     trend_filter_range_lookback: int = 12
     trend_slope_window: int = 3
     trend_consistency_min_signals: int = 2
+    trend_reverse_candle_threshold_pct: float = 0.0
     fallback_window: int = 3
     fallback_min_consecutive: int = 2
     fallback_min_atr: float = 0.008
@@ -276,7 +279,7 @@ def load_new_listing_strategy_config(
     tuning_min_total_trades = max(1, base.getint("tuning_min_total_trades", fallback=30))
     tuning_min_gap_trades = max(1, base.getint("tuning_min_gap_trades", fallback=15))
     trend_filter_min_ema = max(
-        0.0,
+        MIN_TREND_FILTER_MIN_EMA,
         _normalize_percent(
             base.getfloat("trend_filter_min_ema", fallback=0.6),
             assume_percent=True,
@@ -301,6 +304,13 @@ def load_new_listing_strategy_config(
     trend_slope_window = max(1, base.getint("trend_slope_window", fallback=3))
     trend_consistency_min_signals = max(
         1, base.getint("trend_consistency_min_signals", fallback=2)
+    )
+    trend_reverse_candle_threshold_pct = max(
+        0.0,
+        _normalize_percent(
+            base.getfloat("trend_reverse_candle_threshold_pct", fallback=1.0),
+            assume_percent=True,
+        ),
     )
     fallback_window = max(1, base.getint("fallback_window", fallback=3))
     fallback_min_consecutive = max(
@@ -342,6 +352,8 @@ def load_new_listing_strategy_config(
         )
     )
     exclude_symbols = _parse_symbol_list(base.get("exclude_symbols", fallback=""))
+    preferred_requirement_raw = base.get("preferred_requirement", fallback="").strip()
+    preferred_requirement_name: Optional[str] = preferred_requirement_raw or None
     config = NewListingStrategyConfig(
         enabled=enabled,
         ema_period=ema_period,
@@ -360,6 +372,7 @@ def load_new_listing_strategy_config(
         max_new_positions=max_new_positions,
         dynamic_exclusion_enabled=dynamic_exclusion_enabled,
         dynamic_exclusion_consecutive_losses=dynamic_exclusion_consecutive_losses,
+        preferred_requirement_name=preferred_requirement_name,
         requirements=requirements,
         exclude_symbols=exclude_symbols,
         atr_period=atr_period,
@@ -376,6 +389,7 @@ def load_new_listing_strategy_config(
         trend_filter_range_lookback=trend_filter_range_lookback,
         trend_slope_window=trend_slope_window,
         trend_consistency_min_signals=trend_consistency_min_signals,
+        trend_reverse_candle_threshold_pct=trend_reverse_candle_threshold_pct,
         fallback_window=fallback_window,
         fallback_min_consecutive=fallback_min_consecutive,
         fallback_min_atr=fallback_min_atr,
@@ -448,6 +462,7 @@ def write_new_listing_strategy_config(
         "max_new_positions": str(config.max_new_positions),
         "dynamic_exclusion_enabled": "true" if config.dynamic_exclusion_enabled else "false",
         "dynamic_exclusion_consecutive_losses": str(config.dynamic_exclusion_consecutive_losses),
+        "preferred_requirement": (config.preferred_requirement_name or ""),
         "atr_period": str(config.atr_period),
         "atr_skip_pct": _format_percent(config.atr_skip_pct),
         "atr_sl_multiplier": _format_float(config.atr_sl_multiplier),
@@ -462,6 +477,9 @@ def write_new_listing_strategy_config(
         "trend_filter_range_lookback": str(config.trend_filter_range_lookback),
         "trend_slope_window": str(config.trend_slope_window),
         "trend_consistency_min_signals": str(config.trend_consistency_min_signals),
+        "trend_reverse_candle_threshold_pct": _format_float(
+            config.trend_reverse_candle_threshold_pct
+        ),
         "fallback_window": str(config.fallback_window),
         "fallback_min_consecutive": str(config.fallback_min_consecutive),
         "fallback_min_atr": _format_float(config.fallback_min_atr),
@@ -545,6 +563,7 @@ def default_new_listing_strategy_config() -> NewListingStrategyConfig:
         trend_filter_range_lookback=12,
         trend_slope_window=3,
         trend_consistency_min_signals=2,
+        trend_reverse_candle_threshold_pct=0.01,
         fallback_window=3,
         fallback_min_consecutive=2,
         fallback_min_atr=0.008,

@@ -944,6 +944,8 @@ class NewListingTradingStrategy:
             "trend_filter_range_lookback": self._config.trend_filter_range_lookback,
             "trend_slope_window": self._config.trend_slope_window,
             "trend_consistency_min_signals": self._config.trend_consistency_min_signals,
+            "trend_reverse_candle_threshold_pct": self._config.trend_reverse_candle_threshold_pct,
+            "preferred_requirement": self._config.preferred_requirement_name,
             "fallback_window": self._config.fallback_window,
             "fallback_min_consecutive": self._config.fallback_min_consecutive,
             "fallback_min_atr": self._config.fallback_min_atr,
@@ -1222,6 +1224,8 @@ class NewListingTradingStrategy:
         volatility_pct: Optional[float],
         requirements: Iterable[TimeframeRequirement],
     ) -> Optional[TimeframeRequirement]:
+        preferred_name = (self._config.preferred_requirement_name or "").lower()
+        matches: list[TimeframeRequirement] = []
         for req in requirements:
             if available_30 < req.min_available_30m:
                 continue
@@ -1232,8 +1236,12 @@ class NewListingTradingStrategy:
                     continue
                 if req.max_volatility_pct is not None and volatility_pct > req.max_volatility_pct:
                     continue
-            return req
-        return None
+            matches.append(req)
+        if preferred_name:
+            for req in matches:
+                if req.name.lower() == preferred_name:
+                    return req
+        return matches[0] if matches else None
 
     def _fetch_candles(self, symbol: str, interval: str, limit: int) -> list[Candle]:
         try:
@@ -1328,9 +1336,15 @@ class NewListingTradingStrategy:
                 }
             )
             if aggregate > 0:
-                return "Long", meta
+                direction, guard_meta = self._apply_recent_candle_reversal("Long", timeframe_data)
+                if guard_meta:
+                    meta["recent_candle_guard"] = guard_meta
+                return direction, meta
             if aggregate < 0:
-                return "Short", meta
+                direction, guard_meta = self._apply_recent_candle_reversal("Short", timeframe_data)
+                if guard_meta:
+                    meta["recent_candle_guard"] = guard_meta
+                return direction, meta
             ema_aggregate = aggregate
         logger.debug("EMA analysis inconclusive for %s; attempting fallback", symbol)
         fallback_trend, fallback_meta = self._fallback_trend(
@@ -1340,6 +1354,13 @@ class NewListingTradingStrategy:
             ema_aggregate=ema_aggregate,
         )
         meta.update(fallback_meta)
+        if fallback_trend:
+            direction, guard_meta = self._apply_recent_candle_reversal(
+                fallback_trend, timeframe_data
+            )
+            if guard_meta:
+                meta["recent_candle_guard"] = guard_meta
+            return direction, meta
         return fallback_trend, meta
 
     def _compute_ema_scores(self, timeframe_data: dict[str, list[Candle]]) -> dict[str, float]:
@@ -1497,6 +1518,58 @@ class NewListingTradingStrategy:
             }
         )
         return ("Long" if direction_sign > 0 else "Short"), meta
+
+    def _apply_recent_candle_reversal(
+        self,
+        direction: str,
+        timeframe_data: dict[str, list[Candle]],
+    ) -> tuple[str, dict[str, Any]]:
+        """Flip direction when recent candles strongly oppose the trend."""
+
+        threshold = max(0.0, self._config.trend_reverse_candle_threshold_pct)
+        guard_meta: dict[str, Any] = {
+            "enabled": threshold > 0.0,
+            "original_direction": direction,
+            "final_direction": direction,
+            "threshold_pct": threshold,
+            "triggered": False,
+            "checked_timeframe": "5m",
+        }
+        if threshold <= 0.0:
+            return direction, guard_meta
+        candles = timeframe_data.get("5m") or []
+        guard_meta["checked_candles"] = min(len(candles), 2)
+        if not candles:
+            guard_meta["reason"] = "missing_candles"
+            return direction, guard_meta
+        desired_sign = 1 if direction.lower() == "long" else -1
+        max_candles = min(len(candles), 2)
+        for offset in range(1, max_candles + 1):
+            candle = candles[-offset]
+            open_price = candle.open
+            close_price = candle.close
+            if open_price <= 0:
+                continue
+            move = (close_price - open_price) / open_price
+            if move == 0.0:
+                continue
+            move_sign = 1 if move > 0 else -1
+            magnitude = abs(move)
+            if move_sign == desired_sign:
+                continue
+            if magnitude >= threshold:
+                new_direction = "Short" if desired_sign > 0 else "Long"
+                guard_meta.update(
+                    {
+                        "triggered": True,
+                        "trigger_candle_offset": offset,
+                        "move_direction": "Long" if move_sign > 0 else "Short",
+                        "move_pct": magnitude,
+                        "final_direction": new_direction,
+                    }
+                )
+                return new_direction, guard_meta
+        return direction, guard_meta
 
     def _attempt_entry(
         self,

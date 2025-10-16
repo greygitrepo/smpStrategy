@@ -14,6 +14,7 @@ from typing import Any, Dict, Iterable, Optional
 
 from src.config.new_listing_strategy_config import (
     MIN_TP_PCT,
+    MIN_TREND_FILTER_MIN_EMA,
     NewListingStrategyConfig,
     load_new_listing_strategy_config,
     write_new_listing_strategy_config,
@@ -83,6 +84,7 @@ class AdaptiveParameterManager:
         "trend_filter_min_atr": 0.02,          # 2%
         "trend_filter_min_range_pct": 0.012,   # 1.2%
         "fallback_threshold_pct": 0.05,        # 5%
+        "trend_reverse_candle_threshold_pct": 0.03,  # 3%
     }
 
     def __init__(
@@ -183,6 +185,12 @@ class AdaptiveParameterManager:
             context.get(
                 "trend_consistency_min_signals",
                 self._config.trend_consistency_min_signals,
+            )
+        )
+        features["trend_reverse_candle_threshold_pct"] = float(
+            context.get(
+                "trend_reverse_candle_threshold_pct",
+                self._config.trend_reverse_candle_threshold_pct,
             )
         )
         features["fallback_window"] = float(
@@ -323,9 +331,13 @@ class AdaptiveParameterManager:
                 value = max(spec["min"], min(spec["max"], value))
             else:
                 variation = spec["variation"]
-                value = base + generator.uniform(-variation, variation)
-                value = max(spec["min"], min(spec["max"], value))
-                value = round(value, 6)
+                min_value = spec["min"]
+                max_value = spec["max"]
+                lower = max(min_value, base - variation)
+                upper = min(max_value, base + variation)
+                if lower > upper:
+                    lower, upper = min_value, max_value
+                value = round(generator.uniform(lower, upper), 6)
             candidate[name] = value
         # maintain intuitive ordering between EMA weights
         candidate["weight_5m"] = max(candidate["weight_5m"], candidate["weight_15m"], candidate["weight_30m"])
@@ -586,7 +598,7 @@ class AdaptiveParameterManager:
             "weight_30m": {"type": "float", "min": 0.1, "max": 3.0, "variation": 0.3},
             "trend_filter_min_ema": {
                 "type": "float",
-                "min": 0.001,
+                "min": MIN_TREND_FILTER_MIN_EMA,
                 "max": 0.05,
                 "variation": 0.003,
             },
@@ -625,6 +637,12 @@ class AdaptiveParameterManager:
                 "min": 1,
                 "max": 3,
                 "variation": 1,
+            },
+            "trend_reverse_candle_threshold_pct": {
+                "type": "float",
+                "min": 0.0,
+                "max": 0.05,
+                "variation": 0.003,
             },
             "fallback_window": {
                 "type": "int",
