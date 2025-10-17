@@ -383,10 +383,13 @@ class AdaptiveParameterManager:
         if self._experiment is None:
             return
         trades = self._experiment.trades
+        trade_count = len(trades)
         pnl = self._experiment.pnl
-        avg = pnl / max(1, len(trades))
+        avg = pnl / max(1, trade_count)
         baseline_avg = self._experiment.baseline_avg_pnl
         success = avg >= baseline_avg
+        if trade_count == 0:
+            success = False
         window_snapshot = snapshot.get("window", {}) if snapshot else {}
         win_rate = float(window_snapshot.get("win_rate", 0.0) or 0.0)
         window_trades = int(window_snapshot.get("trades", 0) or 0)
