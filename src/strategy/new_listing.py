@@ -518,16 +518,14 @@ class NewListingTradingStrategy:
         return round(aligned, 10)
 
     def _exclude_symbol(self, symbol: str, reason: str) -> None:
-        if symbol in self._excluded_symbols:
-            logger.debug("Symbol %s already excluded: %s", symbol, reason)
+        normalized = symbol.upper()
+        if normalized in self._static_exclusions:
+            logger.debug("Symbol %s is statically excluded; reason=%s", normalized, reason)
             return
-        if symbol in self._static_exclusions:
-            logger.debug("Symbol %s is statically excluded; reason=%s", symbol, reason)
+        if normalized in self._excluded_symbols:
+            logger.debug("Symbol %s already excluded; ignoring additional reason=%s", normalized, reason)
             return
-        self._dynamic_exclusions.add(symbol)
-        self._excluded_symbols.add(symbol)
-        logger.warning("Excluding %s from discovery: %s", symbol, reason)
-        self._persist_exclusions()
+        logger.info("Dynamic exclusion disabled; ignoring request to exclude %s: %s", normalized, reason)
 
     def _resolve_exclusion_file(self) -> Path:
         return Path(__file__).resolve().parents[2] / "config" / _EXCLUSION_FILE_NAME
@@ -544,14 +542,14 @@ class NewListingTradingStrategy:
             return
         if isinstance(payload, list):
             dynamic = {str(value).upper() for value in payload if str(value).strip()}
-            self._dynamic_exclusions.update(dynamic)
-            self._excluded_symbols.update(dynamic)
             if dynamic:
                 logger.info(
-                    "Loaded %s persisted exclusions: %s",
+                    "Ignoring %s persisted dynamic exclusions because the feature is disabled: %s",
                     len(dynamic),
                     ", ".join(sorted(dynamic)),
                 )
+                self._dynamic_exclusions.difference_update(dynamic)
+                self._excluded_symbols.difference_update(dynamic)
         else:
             logger.warning(
                 "Unexpected exclusion payload in %s (expected list, got %s)",
