@@ -7,15 +7,17 @@ import copy
 import json
 import logging
 import random
+import math
+import statistics
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 
 from src.config.new_listing_strategy_config import (
-    MIN_TP_PCT,
-    MIN_TREND_FILTER_MIN_EMA,
     NewListingStrategyConfig,
+    TUNABLE_PARAMETER_SPECS,
     load_new_listing_strategy_config,
     write_new_listing_strategy_config,
 )
@@ -62,10 +64,12 @@ class ExperimentState:
     candidate: Dict[str, float]
     baseline_values: Dict[str, float]
     baseline_avg_pnl: float
+    baseline_metric_name: str
     baseline_snapshot: Dict[str, Any]
     start_time: datetime
     start_trade_index: int
     trades: list[TradeRecord] = field(default_factory=list)
+    returns: list[float] = field(default_factory=list)
     pnl: float = 0.0
 
     def should_finish(self, now: datetime, max_trades: int, max_duration: timedelta) -> bool:
@@ -79,6 +83,30 @@ class AdaptiveParameterManager:
 
     _FEATURE_ALPHA = 0.05
     _MIN_SUCCESS_WIN_RATE = 0.60
+    _RECENT_FEATURE_MAXLEN = 64
+    _RECENT_FEATURE_WEIGHT = 0.45
+    _CANDIDATE_SAMPLE_SIZE = 48
+    _MIN_EXPERIMENT_TRADES = 10
+    _CONFIDENCE_Z = 1.96
+    _POLY_SQUARED_FEATURES: tuple[str, ...] = (
+        "allocation_pct",
+        "tp_pct",
+        "sl_pct",
+        "atr_skip_pct",
+        "candidate_score",
+        "score_threshold",
+        "trend_range_pct",
+    )
+    _POLY_INTERACTION_FEATURES: tuple[tuple[str, str], ...] = (
+        ("allocation_pct", "tp_pct"),
+        ("allocation_pct", "sl_pct"),
+        ("tp_pct", "sl_pct"),
+        ("weight_5m", "weight_15m"),
+        ("weight_15m", "weight_30m"),
+        ("score_threshold", "candidate_score"),
+        ("trend_filter_min_atr", "trend_filter_min_range_pct"),
+        ("trend_range_pct", "trend_reversals"),
+    )
     _PARAM_UPPER_BOUNDS: Dict[str, float] = {
         "trend_filter_min_ema": 0.009,          # 0.9%
         "trend_filter_min_atr": 0.02,          # 2%
@@ -114,6 +142,7 @@ class AdaptiveParameterManager:
         self._model_state_file = self._model_dir / "model_state.json"
         self._model = OnlineLinearRegressor()
         self._feature_means: Dict[str, float] = {}
+        self._recent_features: deque[Dict[str, float]] = deque(maxlen=self._RECENT_FEATURE_MAXLEN)
         self._total_trades = 0
         self._trades_since_update = 0
         self._last_candidate_time = datetime.now(timezone.utc)
@@ -133,11 +162,14 @@ class AdaptiveParameterManager:
             for trade in trades:
                 features = self._build_features(trade)
                 self._update_feature_means(features)
-                self._model.partial_fit(features, trade.realized_pnl)
-                self._append_training_example(features, trade.realized_pnl, trade)
+                model_features = self._augment_model_features(features)
+                target = self._compute_trade_return(trade)
+                self._model.partial_fit(model_features, target)
+                self._append_training_example(model_features, target, trade)
                 self._total_trades += 1
                 if self._experiment is not None:
                     self._experiment.trades.append(trade)
+                    self._experiment.returns.append(target)
                     self._experiment.pnl += trade.realized_pnl
                 self._trades_since_update += 1
             self._save_model_state()
@@ -249,6 +281,78 @@ class AdaptiveParameterManager:
                 self._feature_means[name] = value
             else:
                 self._feature_means[name] = previous + alpha * (value - previous)
+        self._recent_features.append(dict(features))
+
+    def _augment_model_features(self, base_features: Dict[str, float]) -> Dict[str, float]:
+        """Generate polynomial and interaction features for richer model capacity."""
+
+        enriched = dict(base_features)
+        for name in self._POLY_SQUARED_FEATURES:
+            value = enriched.get(name)
+            if value is None:
+                continue
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                continue
+            enriched[f"{name}__sq"] = numeric * numeric
+        for left, right in self._POLY_INTERACTION_FEATURES:
+            if left not in enriched or right not in enriched:
+                continue
+            try:
+                left_val = float(enriched[left])
+                right_val = float(enriched[right])
+            except (TypeError, ValueError):
+                continue
+            enriched[self._interaction_feature_name(left, right)] = left_val * right_val
+        return enriched
+
+    @staticmethod
+    def _interaction_feature_name(left: str, right: str) -> str:
+        if left <= right:
+            first, second = left, right
+        else:
+            first, second = right, left
+        return f"{first}__x__{second}"
+
+    def _recent_feature_average(self) -> Dict[str, float]:
+        if not self._recent_features:
+            return {}
+        aggregate: Dict[str, float] = {}
+        counts: Dict[str, int] = {}
+        for snapshot in self._recent_features:
+            for name, value in snapshot.items():
+                try:
+                    numeric = float(value)
+                except (TypeError, ValueError):
+                    continue
+                aggregate[name] = aggregate.get(name, 0.0) + numeric
+                counts[name] = counts.get(name, 0) + 1
+        return {name: aggregate[name] / counts[name] for name in aggregate if counts.get(name)}
+
+    def _compute_trade_return(self, trade: TradeRecord) -> float:
+        """Derive a position-level return target for model training."""
+
+        if trade.return_pct is not None:
+            return float(trade.return_pct)
+        if trade.notional:
+            try:
+                return float(trade.realized_pnl / trade.notional)
+            except ZeroDivisionError:
+                return 0.0
+        context_notional = (
+            trade.metadata.get("context", {}).get("notional") if trade.metadata else None
+        )
+        try:
+            notional = float(context_notional) if context_notional is not None else None
+        except (TypeError, ValueError):
+            notional = None
+        if notional:
+            try:
+                return float(trade.realized_pnl / notional)
+            except ZeroDivisionError:
+                return 0.0
+        return 0.0
 
     def _append_training_example(
         self,
@@ -263,6 +367,8 @@ class AdaptiveParameterManager:
             "target": target,
             "metadata": {
                 "return_pct": trade.return_pct,
+                "realized_pnl": trade.realized_pnl,
+                "notional": trade.notional,
                 "size": trade.size,
             },
         }
@@ -297,9 +403,11 @@ class AdaptiveParameterManager:
         baseline_score = self._model.predict(baseline_features)
         best_candidate: Optional[Dict[str, float]] = None
         best_score = baseline_score
-        for _ in range(16):
+        for _ in range(self._CANDIDATE_SAMPLE_SIZE):
             candidate = self._sample_candidate()
             candidate = self._clamp_parameters(candidate)
+            if not self._is_candidate_within_bounds(candidate):
+                continue
             features = self._project_features(candidate)
             score = self._model.predict(features)
             if score > best_score + 1e-9:
@@ -309,8 +417,19 @@ class AdaptiveParameterManager:
 
     def _project_features(self, candidate: Dict[str, float]) -> Dict[str, float]:
         projected = dict(self._feature_means)
+        recent_average = self._recent_feature_average()
+        if recent_average:
+            weight = self._RECENT_FEATURE_WEIGHT
+            complement = 1.0 - weight
+            for name, value in recent_average.items():
+                base = projected.get(name, value)
+                try:
+                    base_val = float(base)
+                except (TypeError, ValueError):
+                    base_val = value
+                projected[name] = complement * base_val + weight * value
         projected.update(candidate)
-        return projected
+        return self._augment_model_features(projected)
 
     def _sample_candidate(
         self,
@@ -352,14 +471,29 @@ class AdaptiveParameterManager:
         now: datetime,
     ) -> None:
         candidate = self._clamp_parameters(candidate)
+        if not self._is_candidate_within_bounds(candidate):
+            logger.warning("Rejected candidate outside allowed bounds: %s", candidate)
+            return
         baseline_values = {name: getattr(self._config, name) for name in candidate}
         window_metrics = (snapshot or {}).get("window", {})
         baseline_trades = int(window_metrics.get("trades", 0)) or 1
         baseline_avg = float(window_metrics.get("net_pnl", 0.0)) / baseline_trades
+        baseline_metric_name = "avg_pnl"
+        avg_return = window_metrics.get("avg_return_pct")
+        if avg_return is not None:
+            try:
+                baseline_avg = float(avg_return)
+                baseline_metric_name = "avg_return_pct"
+            except (TypeError, ValueError):
+                baseline_avg = float(window_metrics.get("net_pnl", 0.0)) / baseline_trades
+                baseline_metric_name = "avg_pnl"
+        if not math.isfinite(baseline_avg):
+            baseline_avg = 0.0
         self._experiment = ExperimentState(
             candidate=candidate,
             baseline_values=baseline_values,
             baseline_avg_pnl=baseline_avg,
+            baseline_metric_name=baseline_metric_name,
             baseline_snapshot=window_metrics,
             start_time=now,
             start_trade_index=self._total_trades,
@@ -373,6 +507,9 @@ class AdaptiveParameterManager:
                 "candidate": candidate,
                 "baseline": baseline_values,
                 "baseline_avg_pnl": baseline_avg,
+                "baseline_metric_name": baseline_metric_name,
+                "baseline_avg_metric": baseline_avg,
+                "min_trades_required": self._MIN_EXPERIMENT_TRADES,
                 "start_time": now.isoformat(),
             },
         )
@@ -385,10 +522,28 @@ class AdaptiveParameterManager:
         trades = self._experiment.trades
         trade_count = len(trades)
         pnl = self._experiment.pnl
-        avg = pnl / max(1, trade_count)
+        raw_returns = self._experiment.returns
+        returns = [value for value in raw_returns if math.isfinite(value)]
+        if len(returns) != len(raw_returns):
+            self._experiment.returns = returns
+        avg_return = sum(returns) / len(returns) if returns else 0.0
         baseline_avg = self._experiment.baseline_avg_pnl
-        success = avg >= baseline_avg
-        if trade_count == 0:
+        if len(returns) > 1:
+            std_dev = statistics.stdev(returns)
+            stderr = std_dev / math.sqrt(len(returns))
+            ci_lower = avg_return - self._CONFIDENCE_Z * stderr
+        else:
+            std_dev = 0.0
+            stderr = None
+            ci_lower = avg_return
+        avg_pnl = pnl / max(1, trade_count)
+        success = (
+            trade_count >= self._MIN_EXPERIMENT_TRADES
+            and len(returns) >= self._MIN_EXPERIMENT_TRADES
+            and stderr is not None
+            and ci_lower >= baseline_avg
+        )
+        if trade_count == 0 or not returns:
             success = False
         window_snapshot = snapshot.get("window", {}) if snapshot else {}
         win_rate = float(window_snapshot.get("win_rate", 0.0) or 0.0)
@@ -405,9 +560,16 @@ class AdaptiveParameterManager:
             {
                 "candidate": self._experiment.candidate,
                 "result": result,
-                "avg_pnl": avg,
+                "avg_pnl": avg_pnl,
+                "avg_return_pct": avg_return,
+                "return_ci_lower": ci_lower,
+                "return_std": std_dev,
+                "return_stderr": stderr,
+                "baseline_metric_name": self._experiment.baseline_metric_name,
+                "baseline_avg_metric": baseline_avg,
                 "baseline_avg_pnl": baseline_avg,
                 "trades": len(trades),
+                "min_trades_required": self._MIN_EXPERIMENT_TRADES,
                 "pnl": pnl,
                 "win_rate": win_rate,
                 "ended_at": now.isoformat(),
@@ -493,6 +655,17 @@ class AdaptiveParameterManager:
                     candidate[name] = upper
         return candidate
 
+    def _is_candidate_within_bounds(self, candidate: Dict[str, float]) -> bool:
+        for name, value in candidate.items():
+            spec = self._param_specs.get(name)
+            if spec is None:
+                continue
+            lower = spec["min"]
+            upper = spec["max"]
+            if value < lower or value > upper:
+                return False
+        return True
+
     def _enforce_config_limits(self) -> None:
         updated = False
         for name, upper in self._PARAM_UPPER_BOUNDS.items():
@@ -533,11 +706,13 @@ class AdaptiveParameterManager:
                 "candidate": self._experiment.candidate,
                 "baseline_values": self._experiment.baseline_values,
                 "baseline_avg_pnl": self._experiment.baseline_avg_pnl,
+                "baseline_metric_name": self._experiment.baseline_metric_name,
                 "baseline_snapshot": self._experiment.baseline_snapshot,
                 "start_time": self._experiment.start_time.isoformat(),
                 "start_trade_index": self._experiment.start_trade_index,
                 "pnl": self._experiment.pnl,
                 "trades": [trade.to_dict() for trade in self._experiment.trades],
+                "returns": self._experiment.returns,
             }
         try:
             with self._model_state_file.open("w", encoding="utf-8") as handle:
@@ -571,6 +746,11 @@ class AdaptiveParameterManager:
         experiment_payload = state.get("experiment")
         if isinstance(experiment_payload, dict):
             try:
+                baseline_metric_name = str(
+                    experiment_payload.get("baseline_metric_name", "avg_pnl")
+                )
+                returns_payload = experiment_payload.get("returns", [])
+                returns = [float(value) for value in returns_payload] if returns_payload else []
                 self._experiment = ExperimentState(
                     candidate={str(k): float(v) for k, v in experiment_payload.get("candidate", {}).items()},
                     baseline_values={
@@ -578,10 +758,12 @@ class AdaptiveParameterManager:
                         for k, v in experiment_payload.get("baseline_values", {}).items()
                     },
                     baseline_avg_pnl=float(experiment_payload.get("baseline_avg_pnl", 0.0)),
+                    baseline_metric_name=baseline_metric_name,
                     baseline_snapshot=dict(experiment_payload.get("baseline_snapshot", {})),
                     start_time=datetime.fromisoformat(experiment_payload.get("start_time")),
                     start_trade_index=int(experiment_payload.get("start_trade_index", 0)),
                     trades=[TradeRecord.from_dict(item) for item in experiment_payload.get("trades", [])],
+                    returns=returns,
                     pnl=float(experiment_payload.get("pnl", 0.0)),
                 )
             except Exception as exc:  # noqa: BLE001
@@ -589,125 +771,7 @@ class AdaptiveParameterManager:
                 self._experiment = None
 
     def _build_param_specs(self) -> Dict[str, Dict[str, Any]]:
-        return {
-            "allocation_pct": {"type": "float", "min": 0.01, "max": 0.2, "variation": 0.02},
-            "tp_pct": {"type": "float", "min": MIN_TP_PCT, "max": 0.06, "variation": 0.005},
-            "sl_pct": {"type": "float", "min": 0.004, "max": 0.08, "variation": 0.006},
-            "atr_skip_pct": {"type": "float", "min": 0.005, "max": 0.2, "variation": 0.01},
-            "fallback_threshold_pct": {"type": "float", "min": 0.005, "max": 0.12, "variation": 0.01},
-            "ema_period": {"type": "int", "min": 3, "max": 30, "variation": 2},
-            "weight_5m": {"type": "float", "min": 1.0, "max": 5.0, "variation": 0.3},
-            "weight_15m": {"type": "float", "min": 0.5, "max": 4.0, "variation": 0.3},
-            "weight_30m": {"type": "float", "min": 0.1, "max": 3.0, "variation": 0.3},
-            "trend_filter_min_ema": {
-                "type": "float",
-                "min": MIN_TREND_FILTER_MIN_EMA,
-                "max": 0.05,
-                "variation": 0.003,
-            },
-            "trend_filter_min_atr": {
-                "type": "float",
-                "min": 0.005,
-                "max": 0.1,
-                "variation": 0.005,
-            },
-            "trend_filter_min_range_pct": {
-                "type": "float",
-                "min": 0.002,
-                "max": 0.08,
-                "variation": 0.004,
-            },
-            "trend_filter_max_reversals": {
-                "type": "int",
-                "min": 0,
-                "max": 10,
-                "variation": 1,
-            },
-            "trend_filter_range_lookback": {
-                "type": "int",
-                "min": 6,
-                "max": 72,
-                "variation": 4,
-            },
-            "trend_slope_window": {
-                "type": "int",
-                "min": 1,
-                "max": 6,
-                "variation": 1,
-            },
-            "trend_consistency_min_signals": {
-                "type": "int",
-                "min": 1,
-                "max": 3,
-                "variation": 1,
-            },
-            "trend_reverse_candle_threshold_pct": {
-                "type": "float",
-                "min": 0.0,
-                "max": 0.05,
-                "variation": 0.003,
-            },
-            "fallback_window": {
-                "type": "int",
-                "min": 1,
-                "max": 6,
-                "variation": 1,
-            },
-            "fallback_min_consecutive": {
-                "type": "int",
-                "min": 1,
-                "max": 5,
-                "variation": 1,
-            },
-            "fallback_min_atr": {
-                "type": "float",
-                "min": 0.002,
-                "max": 0.06,
-                "variation": 0.004,
-            },
-            "fallback_max_ema": {
-                "type": "float",
-                "min": 0.001,
-                "max": 0.04,
-                "variation": 0.003,
-            },
-            "score_threshold": {
-                "type": "float",
-                "min": 0.5,
-                "max": 5.0,
-                "variation": 0.3,
-            },
-            "score_ema_weight": {
-                "type": "float",
-                "min": 0.2,
-                "max": 2.0,
-                "variation": 0.2,
-            },
-            "score_range_weight": {
-                "type": "float",
-                "min": 0.2,
-                "max": 2.0,
-                "variation": 0.2,
-            },
-            "score_atr_weight": {
-                "type": "float",
-                "min": 0.1,
-                "max": 1.5,
-                "variation": 0.15,
-            },
-            "score_reversal_penalty": {
-                "type": "float",
-                "min": 0.1,
-                "max": 1.5,
-                "variation": 0.15,
-            },
-            "score_atr_ceiling": {
-                "type": "float",
-                "min": 2.0,
-                "max": 12.0,
-                "variation": 1.0,
-            },
-        }
+        return copy.deepcopy(TUNABLE_PARAMETER_SPECS)
 
 
 __all__ = ["AdaptiveParameterManager"]

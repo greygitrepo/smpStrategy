@@ -6,7 +6,7 @@ import configparser
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 _CONFIG_ENV_VAR = "NEW_LISTING_STRATEGY_CONFIG"
 _DEFAULT_FILE_NAME = "newListingStrategy.ini"
@@ -14,6 +14,126 @@ _CONFIG_DIR = Path(__file__).resolve().parents[2] / "config"
 
 MIN_TP_PCT = 0.012  # enforce 1.2% floor for take-profit percentage
 MIN_TREND_FILTER_MIN_EMA = 0.0048  # prevent trend filter EMA threshold from getting too weak
+
+TUNABLE_PARAMETER_SPECS: dict[str, dict[str, Any]] = {
+    "allocation_pct": {"type": "float", "min": 0.01, "max": 0.2, "variation": 0.02},
+    "tp_pct": {"type": "float", "min": MIN_TP_PCT, "max": 0.06, "variation": 0.005},
+    "sl_pct": {"type": "float", "min": 0.004, "max": 0.08, "variation": 0.006},
+    "atr_skip_pct": {"type": "float", "min": 0.005, "max": 0.2, "variation": 0.01},
+    "fallback_threshold_pct": {"type": "float", "min": 0.005, "max": 0.12, "variation": 0.01},
+    "ema_period": {"type": "int", "min": 3, "max": 30, "variation": 2},
+    "weight_5m": {"type": "float", "min": 1.0, "max": 5.0, "variation": 0.3},
+    "weight_15m": {"type": "float", "min": 0.5, "max": 4.0, "variation": 0.3},
+    "weight_30m": {"type": "float", "min": 0.1, "max": 3.0, "variation": 0.3},
+    "trend_filter_min_ema": {
+        "type": "float",
+        "min": MIN_TREND_FILTER_MIN_EMA,
+        "max": 0.05,
+        "variation": 0.003,
+    },
+    "trend_filter_min_atr": {
+        "type": "float",
+        "min": 0.005,
+        "max": 0.1,
+        "variation": 0.005,
+    },
+    "trend_filter_min_range_pct": {
+        "type": "float",
+        "min": 0.002,
+        "max": 0.2,
+        "variation": 0.004,
+    },
+    "trend_filter_max_reversals": {
+        "type": "int",
+        "min": 0,
+        "max": 10,
+        "variation": 1,
+    },
+    "trend_filter_range_lookback": {
+        "type": "int",
+        "min": 6,
+        "max": 72,
+        "variation": 4,
+    },
+    "trend_slope_window": {
+        "type": "int",
+        "min": 1,
+        "max": 6,
+        "variation": 1,
+    },
+    "trend_consistency_min_signals": {
+        "type": "int",
+        "min": 1,
+        "max": 3,
+        "variation": 1,
+    },
+    "trend_reverse_candle_threshold_pct": {
+        "type": "float",
+        "min": 0.0,
+        "max": 0.05,
+        "variation": 0.003,
+    },
+    "fallback_window": {
+        "type": "int",
+        "min": 1,
+        "max": 6,
+        "variation": 1,
+    },
+    "fallback_min_consecutive": {
+        "type": "int",
+        "min": 1,
+        "max": 5,
+        "variation": 1,
+    },
+    "fallback_min_atr": {
+        "type": "float",
+        "min": 0.002,
+        "max": 0.06,
+        "variation": 0.004,
+    },
+    "fallback_max_ema": {
+        "type": "float",
+        "min": 0.001,
+        "max": 0.04,
+        "variation": 0.003,
+    },
+    "score_threshold": {
+        "type": "float",
+        "min": 0.5,
+        "max": 30.0,
+        "variation": 0.3,
+    },
+    "score_ema_weight": {
+        "type": "float",
+        "min": 0.2,
+        "max": 2.0,
+        "variation": 0.2,
+    },
+    "score_range_weight": {
+        "type": "float",
+        "min": 0.2,
+        "max": 2.0,
+        "variation": 0.2,
+    },
+    "score_atr_weight": {
+        "type": "float",
+        "min": 0.1,
+        "max": 1.5,
+        "variation": 0.15,
+    },
+    "score_reversal_penalty": {
+        "type": "float",
+        "min": 0.1,
+        "max": 1.5,
+        "variation": 0.15,
+    },
+    "score_atr_ceiling": {
+        "type": "float",
+        "min": 2.0,
+        "max": 12.0,
+        "variation": 1.0,
+    },
+}
 
 
 @dataclass(slots=True)
@@ -157,6 +277,18 @@ def _parse_requirement(section_name: str, section: configparser.SectionProxy) ->
     )
 
 
+def _validate_tunable_value(name: str, value: float | int) -> None:
+    spec = TUNABLE_PARAMETER_SPECS.get(name)
+    if spec is None:
+        return
+    lower = spec["min"]
+    upper = spec["max"]
+    numeric = float(value)
+    if numeric < lower or numeric > upper:
+        raise ValueError(
+            f"{name}={value} outside allowed range [{lower}, {upper}]"
+        )
+
 def resolve_new_listing_strategy_config_path(
     path: str | os.PathLike[str] | None = None,
 ) -> Path:
@@ -192,18 +324,24 @@ def load_new_listing_strategy_config(
     base = parser[base_section_name]
     enabled = base.getboolean("enabled", fallback=True)
     enable_parameter_tuner = base.getboolean("enable_parameter_tuner", fallback=True)
-    ema_period = max(2, base.getint("ema_period", fallback=9))
+    ema_period_raw = base.getint("ema_period", fallback=9)
+    _validate_tunable_value("ema_period", ema_period_raw)
+    ema_period = int(ema_period_raw)
     leverage = max(
         1.0,
         base.getfloat("leverage", fallback=3.0),
     )
-    allocation_pct = max(
-        0.0,
-        _normalize_percent(
-            base.getfloat("allocation_pct", fallback=0.05),
-            assume_percent=True,
-        ),
+    allocation_pct = _normalize_percent(
+        base.getfloat("allocation_pct", fallback=0.05),
+        assume_percent=True,
     )
+    _validate_tunable_value("allocation_pct", allocation_pct)
+    weight_5m = base.getfloat("weight_5m", fallback=3.0)
+    _validate_tunable_value("weight_5m", weight_5m)
+    weight_15m = base.getfloat("weight_15m", fallback=2.0)
+    _validate_tunable_value("weight_15m", weight_15m)
+    weight_30m = base.getfloat("weight_30m", fallback=1.0)
+    _validate_tunable_value("weight_30m", weight_30m)
     max_min_margin_share = max(
         0.0,
         min(
@@ -221,21 +359,17 @@ def load_new_listing_strategy_config(
             assume_percent=True,
         ),
     )
-    fallback_threshold_pct = max(
-        0.0,
-        _normalize_percent(
-            base.getfloat("fallback_threshold_pct", fallback=3.0),
-            assume_percent=True,
-        ),
+    fallback_threshold_pct = _normalize_percent(
+        base.getfloat("fallback_threshold_pct", fallback=3.0),
+        assume_percent=True,
     )
+    _validate_tunable_value("fallback_threshold_pct", fallback_threshold_pct)
     atr_period = max(1, base.getint("atr_period", fallback=12))
-    atr_skip_pct = max(
-        0.0,
-        _normalize_percent(
-            base.getfloat("atr_skip_pct", fallback=7.5),
-            assume_percent=True,
-        ),
+    atr_skip_pct = _normalize_percent(
+        base.getfloat("atr_skip_pct", fallback=7.5),
+        assume_percent=True,
     )
+    _validate_tunable_value("atr_skip_pct", atr_skip_pct)
     atr_sl_multiplier = max(0.0, base.getfloat("atr_sl_multiplier", fallback=1.0))
     atr_sl_cap_raw = base.get("atr_sl_cap", fallback="").strip()
     atr_sl_cap: Optional[float]
@@ -256,20 +390,16 @@ def load_new_listing_strategy_config(
             assume_percent=True,
         ),
     )
-    tp_pct = max(
-        MIN_TP_PCT,
-        _normalize_percent(
-            base.getfloat("tp_pct", fallback=1.4),
-            assume_percent=True,
-        ),
+    tp_pct = _normalize_percent(
+        base.getfloat("tp_pct", fallback=1.4),
+        assume_percent=True,
     )
-    sl_pct = max(
-        0.0,
-        _normalize_percent(
-            base.getfloat("sl_pct", fallback=1.4),
-            assume_percent=True,
-        ),
+    _validate_tunable_value("tp_pct", tp_pct)
+    sl_pct = _normalize_percent(
+        base.getfloat("sl_pct", fallback=1.4),
+        assume_percent=True,
     )
+    _validate_tunable_value("sl_pct", sl_pct)
     min_5m_bars = max(1, base.getint("min_5m_bars", fallback=20))
     max_new_positions = max(1, base.getint("max_new_positions", fallback=3))
     dynamic_exclusion_enabled = base.getboolean("dynamic_exclusion_enabled", fallback=True)
@@ -278,64 +408,66 @@ def load_new_listing_strategy_config(
     )
     tuning_min_total_trades = max(1, base.getint("tuning_min_total_trades", fallback=30))
     tuning_min_gap_trades = max(1, base.getint("tuning_min_gap_trades", fallback=15))
-    trend_filter_min_ema = max(
-        MIN_TREND_FILTER_MIN_EMA,
-        _normalize_percent(
-            base.getfloat("trend_filter_min_ema", fallback=0.6),
-            assume_percent=True,
-        ),
+    trend_filter_min_ema = _normalize_percent(
+        base.getfloat("trend_filter_min_ema", fallback=0.6),
+        assume_percent=True,
     )
-    trend_filter_min_atr = max(
-        0.0,
-        _normalize_percent(
-            base.getfloat("trend_filter_min_atr", fallback=1.5),
-            assume_percent=True,
-        ),
+    _validate_tunable_value("trend_filter_min_ema", trend_filter_min_ema)
+    trend_filter_min_atr = _normalize_percent(
+        base.getfloat("trend_filter_min_atr", fallback=1.5),
+        assume_percent=True,
     )
-    trend_filter_min_range_pct = max(
-        0.0,
-        _normalize_percent(
-            base.getfloat("trend_filter_min_range_pct", fallback=0.8),
-            assume_percent=True,
-        ),
+    _validate_tunable_value("trend_filter_min_atr", trend_filter_min_atr)
+    trend_filter_min_range_pct = _normalize_percent(
+        base.getfloat("trend_filter_min_range_pct", fallback=0.8),
+        assume_percent=True,
     )
-    trend_filter_max_reversals = max(0, base.getint("trend_filter_max_reversals", fallback=3))
-    trend_filter_range_lookback = max(3, base.getint("trend_filter_range_lookback", fallback=12))
-    trend_slope_window = max(1, base.getint("trend_slope_window", fallback=3))
-    trend_consistency_min_signals = max(
-        1, base.getint("trend_consistency_min_signals", fallback=2)
+    _validate_tunable_value("trend_filter_min_range_pct", trend_filter_min_range_pct)
+    trend_filter_max_reversals_raw = base.getint("trend_filter_max_reversals", fallback=3)
+    _validate_tunable_value("trend_filter_max_reversals", trend_filter_max_reversals_raw)
+    trend_filter_max_reversals = int(trend_filter_max_reversals_raw)
+    trend_filter_range_lookback_raw = base.getint("trend_filter_range_lookback", fallback=12)
+    _validate_tunable_value("trend_filter_range_lookback", trend_filter_range_lookback_raw)
+    trend_filter_range_lookback = int(trend_filter_range_lookback_raw)
+    trend_slope_window_raw = base.getint("trend_slope_window", fallback=3)
+    _validate_tunable_value("trend_slope_window", trend_slope_window_raw)
+    trend_slope_window = int(trend_slope_window_raw)
+    trend_consistency_min_signals_raw = base.getint("trend_consistency_min_signals", fallback=2)
+    _validate_tunable_value("trend_consistency_min_signals", trend_consistency_min_signals_raw)
+    trend_consistency_min_signals = int(trend_consistency_min_signals_raw)
+    trend_reverse_candle_threshold_pct = _normalize_percent(
+        base.getfloat("trend_reverse_candle_threshold_pct", fallback=1.0),
+        assume_percent=True,
     )
-    trend_reverse_candle_threshold_pct = max(
-        0.0,
-        _normalize_percent(
-            base.getfloat("trend_reverse_candle_threshold_pct", fallback=1.0),
-            assume_percent=True,
-        ),
+    _validate_tunable_value("trend_reverse_candle_threshold_pct", trend_reverse_candle_threshold_pct)
+    fallback_window_raw = base.getint("fallback_window", fallback=3)
+    _validate_tunable_value("fallback_window", fallback_window_raw)
+    fallback_window = int(fallback_window_raw)
+    fallback_min_consecutive_raw = base.getint("fallback_min_consecutive", fallback=2)
+    _validate_tunable_value("fallback_min_consecutive", fallback_min_consecutive_raw)
+    fallback_min_consecutive = int(fallback_min_consecutive_raw)
+    fallback_min_atr = _normalize_percent(
+        base.getfloat("fallback_min_atr", fallback=0.8),
+        assume_percent=True,
     )
-    fallback_window = max(1, base.getint("fallback_window", fallback=3))
-    fallback_min_consecutive = max(
-        1, base.getint("fallback_min_consecutive", fallback=2)
+    _validate_tunable_value("fallback_min_atr", fallback_min_atr)
+    fallback_max_ema = _normalize_percent(
+        base.getfloat("fallback_max_ema", fallback=0.4),
+        assume_percent=True,
     )
-    fallback_min_atr = max(
-        0.0,
-        _normalize_percent(
-            base.getfloat("fallback_min_atr", fallback=0.8),
-            assume_percent=True,
-        ),
-    )
-    fallback_max_ema = max(
-        0.0,
-        _normalize_percent(
-            base.getfloat("fallback_max_ema", fallback=0.4),
-            assume_percent=True,
-        ),
-    )
-    score_threshold = max(0.0, base.getfloat("score_threshold", fallback=1.5))
-    score_ema_weight = max(0.0, base.getfloat("score_ema_weight", fallback=1.0))
-    score_range_weight = max(0.0, base.getfloat("score_range_weight", fallback=0.8))
-    score_atr_weight = max(0.0, base.getfloat("score_atr_weight", fallback=0.6))
-    score_reversal_penalty = max(0.0, base.getfloat("score_reversal_penalty", fallback=0.7))
-    score_atr_ceiling = max(0.0, base.getfloat("score_atr_ceiling", fallback=5.0))
+    _validate_tunable_value("fallback_max_ema", fallback_max_ema)
+    score_threshold = base.getfloat("score_threshold", fallback=1.5)
+    _validate_tunable_value("score_threshold", score_threshold)
+    score_ema_weight = base.getfloat("score_ema_weight", fallback=1.0)
+    _validate_tunable_value("score_ema_weight", score_ema_weight)
+    score_range_weight = base.getfloat("score_range_weight", fallback=0.8)
+    _validate_tunable_value("score_range_weight", score_range_weight)
+    score_atr_weight = base.getfloat("score_atr_weight", fallback=0.6)
+    _validate_tunable_value("score_atr_weight", score_atr_weight)
+    score_reversal_penalty = base.getfloat("score_reversal_penalty", fallback=0.7)
+    _validate_tunable_value("score_reversal_penalty", score_reversal_penalty)
+    score_atr_ceiling = base.getfloat("score_atr_ceiling", fallback=5.0)
+    _validate_tunable_value("score_atr_ceiling", score_atr_ceiling)
     requirement_sections: list[TimeframeRequirement] = []
     prefix = f"{base_section_name}."
     for section_name in parser.sections():
@@ -358,9 +490,9 @@ def load_new_listing_strategy_config(
         enabled=enabled,
         ema_period=ema_period,
         enable_parameter_tuner=enable_parameter_tuner,
-        weight_5m=base.getfloat("weight_5m", fallback=3.0),
-        weight_15m=base.getfloat("weight_15m", fallback=2.0),
-        weight_30m=base.getfloat("weight_30m", fallback=1.0),
+        weight_5m=weight_5m,
+        weight_15m=weight_15m,
+        weight_30m=weight_30m,
         fallback_threshold_pct=fallback_threshold_pct,
         leverage=leverage,
         allocation_pct=allocation_pct,
@@ -442,6 +574,13 @@ def write_new_listing_strategy_config(
     config: NewListingStrategyConfig,
     path: str | os.PathLike[str],
 ) -> Path:
+    for name in TUNABLE_PARAMETER_SPECS:
+        if not hasattr(config, name):
+            continue
+        value = getattr(config, name)
+        if value is None:
+            continue
+        _validate_tunable_value(name, value)
     parser = configparser.ConfigParser()
     section_name = "new_listing_strategy"
     base_section = {
