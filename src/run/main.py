@@ -7,6 +7,7 @@ import sys
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Iterable
 
 # allow running as a script (e.g. F5 in IDE) without manual PYTHONPATH tweaks
 if __package__ is None or __package__ == "":
@@ -36,6 +37,55 @@ from src.strategy import NewListingTradingStrategy  # noqa: E402  pylint: disabl
 
 logger = logging.getLogger("smpStrategy")
 
+_LOG_DIR_NAME = "logs"
+_LOG_FILE_PREFIX = "smpStrategy_"
+_LOG_FILE_SUFFIX = ".log"
+_MAX_LOG_FILES = 30
+_MAX_LOG_AGE_DAYS = 7
+_MAX_LOG_DISK_MB = 512
+
+
+def _cleanup_old_logs(log_dir: Path, protected: Iterable[Path] | None = None) -> None:
+    protected_paths = {p.resolve() for p in protected or []}
+    log_pattern = f"{_LOG_FILE_PREFIX}*{_LOG_FILE_SUFFIX}"
+    files: list[tuple[float, Path]] = []
+    for path in log_dir.glob(log_pattern):
+        resolved = path.resolve()
+        if resolved in protected_paths:
+            continue
+        try:
+            stats = path.stat()
+        except FileNotFoundError:
+            continue
+        files.append((stats.st_mtime, path))
+    files.sort(key=lambda item: item[0], reverse=True)
+    max_bytes = _MAX_LOG_DISK_MB * 1024 * 1024
+    kept_size = 0
+    now = datetime.now()
+    for index, (_, path) in enumerate(files):
+        try:
+            stats = path.stat()
+        except FileNotFoundError:
+            continue
+        age = now - datetime.fromtimestamp(stats.st_mtime)
+        keep = True
+        if _MAX_LOG_AGE_DAYS is not None and age > timedelta(days=_MAX_LOG_AGE_DAYS):
+            keep = False
+        if _MAX_LOG_FILES is not None and index >= _MAX_LOG_FILES:
+            keep = False
+        if keep and _MAX_LOG_DISK_MB is not None:
+            if kept_size + stats.st_size > max_bytes:
+                keep = False
+        if keep:
+            kept_size += stats.st_size
+            continue
+        try:
+            path.unlink(missing_ok=False)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            logger.warning("Failed to remove old log %s: %s", path, exc)
+
 
 def _configure_logging(log_file: Path) -> None:
     formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s - %(message)s")
@@ -53,12 +103,12 @@ def _configure_logging(log_file: Path) -> None:
 
 
 def _setup_logging() -> tuple[Path, datetime]:
-    log_dir = Path(__file__).resolve().parents[2] / "log"
+    log_dir = Path(__file__).resolve().parents[2] / _LOG_DIR_NAME
     log_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_file = log_dir / f"smpStrategy_{timestamp}.log"
+    log_file = log_dir / f"{_LOG_FILE_PREFIX}{timestamp}{_LOG_FILE_SUFFIX}"
     _configure_logging(log_file)
-    logging.getLogger("smpStrategy.strategy.new_listing").setLevel(logging.DEBUG)
+    _cleanup_old_logs(log_dir, protected=[log_file])
     logging.getLogger("smpStrategy.strategy.new_listing").setLevel(logging.DEBUG)
     return log_file, datetime.now()
 
