@@ -148,6 +148,7 @@ class AdaptiveParameterManager:
         self._last_candidate_time = datetime.now(timezone.utc)
         self._experiment: Optional[ExperimentState] = None
         self._param_specs = self._build_param_specs()
+        self._normalize_config_types()
         self._load_model_state()
         self._enforce_config_limits()
         self._persist_config()
@@ -474,7 +475,9 @@ class AdaptiveParameterManager:
         if not self._is_candidate_within_bounds(candidate):
             logger.warning("Rejected candidate outside allowed bounds: %s", candidate)
             return
-        baseline_values = {name: getattr(self._config, name) for name in candidate}
+        baseline_values = {
+            name: self._coerce_param_value(name, getattr(self._config, name)) for name in candidate
+        }
         window_metrics = (snapshot or {}).get("window", {})
         baseline_trades = int(window_metrics.get("trades", 0)) or 1
         baseline_avg = float(window_metrics.get("net_pnl", 0.0)) / baseline_trades
@@ -489,6 +492,7 @@ class AdaptiveParameterManager:
                 baseline_metric_name = "avg_pnl"
         if not math.isfinite(baseline_avg):
             baseline_avg = 0.0
+        candidate = {name: self._coerce_param_value(name, value) for name, value in candidate.items()}
         self._experiment = ExperimentState(
             candidate=candidate,
             baseline_values=baseline_values,
@@ -499,7 +503,7 @@ class AdaptiveParameterManager:
             start_trade_index=self._total_trades,
         )
         for name, value in candidate.items():
-            setattr(self._config, name, value)
+            self._apply_config_param(name, value)
         self._persist_config()
         self._log_event(
             "experiment_start",
@@ -553,7 +557,7 @@ class AdaptiveParameterManager:
         result = "accepted" if success else "rolled_back"
         if not success:
             for name, value in self._experiment.baseline_values.items():
-                setattr(self._config, name, value)
+                self._apply_config_param(name, value)
         self._persist_config()
         self._log_event(
             "experiment_end",
@@ -655,6 +659,48 @@ class AdaptiveParameterManager:
                     candidate[name] = upper
         return candidate
 
+    def _coerce_param_value(self, name: str, value: Any) -> float | int:
+        spec = self._param_specs.get(name)
+        if spec is None:
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                return 0.0
+            if not math.isfinite(numeric):
+                numeric = 0.0
+            return numeric
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            numeric = float(spec["min"])
+        if not math.isfinite(numeric):
+            numeric = float(spec["min"])
+        if spec["type"] == "int":
+            coerced: float | int = int(round(numeric))
+        else:
+            coerced = float(numeric)
+        lower = spec["min"]
+        upper = spec["max"]
+        if coerced < lower:
+            coerced = lower
+        elif coerced > upper:
+            coerced = upper
+        if spec["type"] == "int":
+            coerced = int(round(coerced))
+        else:
+            coerced = float(coerced)
+        return coerced
+
+    def _apply_config_param(self, name: str, value: Any) -> float | int:
+        coerced = self._coerce_param_value(name, value)
+        setattr(self._config, name, coerced)
+        return coerced
+
+    def _normalize_config_types(self) -> None:
+        for name in self._param_specs:
+            if hasattr(self._config, name):
+                self._apply_config_param(name, getattr(self._config, name))
+
     def _is_candidate_within_bounds(self, candidate: Dict[str, float]) -> bool:
         for name, value in candidate.items():
             spec = self._param_specs.get(name)
@@ -751,12 +797,17 @@ class AdaptiveParameterManager:
                 )
                 returns_payload = experiment_payload.get("returns", [])
                 returns = [float(value) for value in returns_payload] if returns_payload else []
+                candidate_payload = experiment_payload.get("candidate", {}) or {}
+                baseline_payload = experiment_payload.get("baseline_values", {}) or {}
+                candidate = {
+                    str(k): self._coerce_param_value(str(k), v) for k, v in candidate_payload.items()
+                }
+                baseline_values = {
+                    str(k): self._coerce_param_value(str(k), v) for k, v in baseline_payload.items()
+                }
                 self._experiment = ExperimentState(
-                    candidate={str(k): float(v) for k, v in experiment_payload.get("candidate", {}).items()},
-                    baseline_values={
-                        str(k): float(v)
-                        for k, v in experiment_payload.get("baseline_values", {}).items()
-                    },
+                    candidate=candidate,
+                    baseline_values=baseline_values,
                     baseline_avg_pnl=float(experiment_payload.get("baseline_avg_pnl", 0.0)),
                     baseline_metric_name=baseline_metric_name,
                     baseline_snapshot=dict(experiment_payload.get("baseline_snapshot", {})),

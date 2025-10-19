@@ -989,26 +989,33 @@ class NewListingTradingStrategy:
         symbol: str,
     ) -> Optional[TimeframeDataResult]:
         requirements = self._config.requirements
+        if not requirements:
+            return None
+        ema_period = max(1, int(round(self._config.ema_period)))
+        trend_slope_window = max(1, int(round(self._config.trend_slope_window)))
+        trend_range_lookback = max(1, int(round(self._config.trend_filter_range_lookback)))
+        atr_period = max(1, int(round(self._config.atr_period)))
+        min_5m_bars = max(1, int(round(self._config.min_5m_bars)))
         max_required_30 = max(req.min_30m for req in requirements)
-        base_limit_30 = max(max_required_30, self._config.ema_period + 2)
+        base_limit_30 = max(max_required_30, ema_period + 2)
         candles_30_all = self._fetch_candles(symbol, "30", base_limit_30)
         if not candles_30_all:
             logger.debug("No 30m candles retrieved for %s", symbol)
             return None
         available_30 = len(candles_30_all)
-        ema_window_requirement = self._config.ema_period + self._config.trend_slope_window
+        ema_window_requirement = ema_period + trend_slope_window
         max_required_5 = max(req.min_5m for req in requirements)
         base_limit_5 = max(
             max_required_5,
-            self._config.min_5m_bars,
+            min_5m_bars,
             ema_window_requirement,
-            self._config.atr_period + 2,
-            self._config.trend_filter_range_lookback + 1,
+            atr_period + 2,
+            trend_range_lookback + 1,
         )
         candles_5_all = self._fetch_candles(symbol, "5", base_limit_5)
         volatility_pct: Optional[float] = None
         if candles_5_all:
-            lookback = min(len(candles_5_all), max(2, self._config.trend_filter_range_lookback))
+            lookback = min(len(candles_5_all), max(2, trend_range_lookback))
             if lookback > 0:
                 window = candles_5_all[-lookback:]
                 high = max(c.high for c in window)
@@ -1042,7 +1049,7 @@ class NewListingTradingStrategy:
             "15",
             max(requirement.min_15m, ema_window_requirement),
         )
-        min_5m_required = max(requirement.min_5m, self._config.min_5m_bars)
+        min_5m_required = max(requirement.min_5m, min_5m_bars)
         if candles_5_all:
             candles_5 = candles_5_all[-max(min_5m_required, ema_window_requirement) :]
         else:
@@ -1077,10 +1084,11 @@ class NewListingTradingStrategy:
     ) -> bool:
         frames = timeframe_result.frames
         candles_5 = frames.get("5m") or []
-        if len(candles_5) < max(2, self._config.trend_filter_range_lookback):
+        range_lookback = max(2, int(round(self._config.trend_filter_range_lookback)))
+        if len(candles_5) < range_lookback:
             logger.debug("Trend filter skipping %s due to insufficient 5m candles", symbol)
             return False
-        ema_window = max(1, self._config.trend_slope_window)
+        ema_window = max(1, int(round(self._config.trend_slope_window)))
         try:
             ema_scores = self._compute_ema_scores(frames)
             aggregate = sum(ema_scores.values())
@@ -1103,7 +1111,7 @@ class NewListingTradingStrategy:
                 min_ema_threshold,
             )
             return False
-        required_consistency = max(1, self._config.trend_consistency_min_signals)
+        required_consistency = max(1, int(round(self._config.trend_consistency_min_signals)))
         if aggregate > 0 and positive_signals < required_consistency:
             logger.debug(
                 "Trend filter rejected %s: positive EMA signals %s < %s",
@@ -1132,7 +1140,7 @@ class NewListingTradingStrategy:
                 self._config.trend_filter_min_atr,
             )
             return False
-        lookback = min(len(candles_5), self._config.trend_filter_range_lookback)
+        lookback = min(len(candles_5), range_lookback)
         window = candles_5[-lookback:]
         high = max(c.high for c in window)
         low = min(c.low for c in window)
@@ -1183,12 +1191,16 @@ class NewListingTradingStrategy:
         candles: list[Candle],
         period: int,
     ) -> Optional[float]:
-        if period <= 0:
+        try:
+            period_int = int(round(float(period)))
+        except (TypeError, ValueError):
             return None
-        if len(candles) < period + 1:
+        if period_int <= 0:
+            return None
+        if len(candles) < period_int + 1:
             return None
         trs: list[float] = []
-        start_idx = len(candles) - period
+        start_idx = len(candles) - period_int
         for idx in range(start_idx, len(candles)):
             current = candles[idx]
             prev = candles[idx - 1]
@@ -1254,11 +1266,16 @@ class NewListingTradingStrategy:
 
     def _fetch_candles(self, symbol: str, interval: str, limit: int) -> list[Candle]:
         try:
+            limit_int = int(round(float(limit)))
+        except (TypeError, ValueError):
+            limit_int = 1
+        limit_int = max(1, min(limit_int, 200))
+        try:
             response = self._client.get_kline(
                 category=self._category,
                 symbol=symbol,
                 interval=interval,
-                limit=min(max(limit, 1), 200),
+                limit=limit_int,
             )
         except BybitAPIError as api_exc:
             logger.error(
@@ -1420,8 +1437,8 @@ class NewListingTradingStrategy:
         ema_aggregate: Optional[float],
     ) -> tuple[Optional[str], dict[str, Any]]:
         config = self._config
-        window = max(1, config.fallback_window)
-        min_consecutive = max(1, config.fallback_min_consecutive)
+        window = max(1, int(round(config.fallback_window)))
+        min_consecutive = max(1, int(round(config.fallback_min_consecutive)))
         threshold_pct = config.fallback_threshold_pct * 100.0
         min_atr = config.fallback_min_atr
         max_ema = config.fallback_max_ema * 100.0
